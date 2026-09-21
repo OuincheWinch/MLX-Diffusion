@@ -1,258 +1,187 @@
-================================================================================
-MLX-DIFFUSION — Guide de Démarrage, Commandes & Spécifications des Modèles
-================================================================================
+==========================================================================
+MLX-DIFFUSION — User Guide (English)
+==========================================================================
+Local image-generation studio optimized for Apple Silicon (MLX & Metal GPU).
+Backend: FastAPI (Python)   ·   Frontend: React 19 / Vite   ·   Engines: FAAS / mflux
 
-Studio de génération d'images local optimisé pour Apple Silicon (MLX & Metal GPU).
-Backend FastAPI (Python) + Frontend React 19 / Vite.
-
-
-================================================================================
-1. COMMANDES DE DÉMARRAGE ET D'ARRÊT
-================================================================================
-
-Les deux services (Backend sur le port 8001 et Frontend sur le port 5174) doivent
-être exécutés depuis la racine du projet :
-  cd /Volumes/Externe/IA/MLX-DIFFUSION
-
---------------------------------------------------------------------------------
-A) DÉMARRAGE EN AVANT-PLAN (Recommandé en développement)
---------------------------------------------------------------------------------
-Ouvrir 2 onglets de terminal :
-
-Onglet 1 (Backend FastAPI) :
-  ./dev-backend.sh
-  # (ou: cd backend && caffeinate -s ../venv/bin/uvicorn main:app --reload --port 8001)
-
-Onglet 2 (Frontend Vite) :
-  cd frontend && npm run dev
-  # (ou: cd frontend && caffeinate -s vite)
-
-Pour arrêter : appuyer sur Ctrl + C dans chaque onglet.
-
---------------------------------------------------------------------------------
-B) DÉMARRAGE EN ARRIÈRE-PLAN (Mode Daemon / Headless)
---------------------------------------------------------------------------------
-Depuis la racine du projet :
-
-  # 1. Lancer le backend en arrière-plan
-  nohup ./dev-backend.sh > /tmp/mlx-backend.log 2>&1 &
-
-  # 2. Lancer le frontend en arrière-plan
-  cd frontend && nohup npm run dev > /tmp/mlx-frontend.log 2>&1 &
-  cd ..
-
---------------------------------------------------------------------------------
-C) ARRÊT PROPRE DE TOUS LES SERVICES (One-Liner)
---------------------------------------------------------------------------------
-Pour couper immédiatement et proprement tous les démons (Backend, Frontend, SDXL Engine) :
-
-  kill $(lsof -ti :8001 -ti :5174) 2>/dev/null
-  pkill -f "sdxl_engine" 2>/dev/null
-
-Vérification qu'aucun processus ne subsiste :
-  lsof -i :8001 -i :5174
-  # (Si cette commande ne renvoie rien, tous les services sont éteints proprement)
-
---------------------------------------------------------------------------------
-D) URLS D'ACCÈS
---------------------------------------------------------------------------------
-- Interface Web (Studio) :  http://localhost:5174
-- API Backend (Swagger)   :  http://localhost:8001/docs
-- Port 8001 obligatoire   :  Le port 8000 est réservé aux autres outils locaux.
+All commands below use RELATIVE paths and assume you run them from the
+project root — the folder that contains run.sh, backend/ and frontend/.
+There is no hardcoded machine path, so the repo works from any location.
 
 
-================================================================================
-2. MODÈLES SUPPORTÉS & AVANTAGES COMPARATIFS
-================================================================================
+==========================================================================
+1. REQUIREMENTS
+==========================================================================
+- Mac Apple Silicon (M1–M4, 16 GB+ Unified Memory recommended)
+- macOS Ventura/Sonoma/Sequoia with Metal
+- Python 3.10 (main engine venv  `venv/`)  and Python 3.14 (SDXL engine `venv-sdxl/`)
+- Node.js 18+ (React/Vite frontend)
+- First run downloads model weights (~2–3 GB) into the Hugging Face cache;
+  allow ~20 min.
 
-Le studio intègre 4 moteurs d'inférence complémentaires, tous quantifiés et
-optimisés pour tirer le maximum d'Apple Silicon (16 GB unifiés) sans OOM Metal :
-
---------------------------------------------------------------------------------
-1. FLUX.2-klein 4B (Moteur Principal — Black Forest Labs DiT)
---------------------------------------------------------------------------------
-- Répertoire / ID : flux2-klein-4b (mlx-community/flux2-klein-4b-4bit)
-- Étapes idéales  : 4 steps | Guidance : 1.0 (guidance-distilled, pas de CFG négatif)
-- Vitesse (M1)    : ~90s en 768×768 | ~120–140s en 1024×1024
-
-AVANTAGES CLÉS :
-  ✦ Multi-Références In-Context (1 à 10 images) :
-    Permet de conditionner l'image sur 1 à 10 images de référence simultanées
-    (conservant cohérence des personnages, style, accessoires) en les référençant
-    simplement dans le prompt sous la forme `Image 1`, `Image 2`, etc.
-  ✦ Correspondance Exacte des Couleurs (#HEX) :
-    Respect strict des codes hexadécimaux (#FF3366, #00E5FF, etc.). Une palette
-    visuelle intégrée permet l'insertion directe à l'emplacement du curseur.
-  ✦ Décodage PiD (mflux) :
-    Option sous les paramètres avancés pour remplacer le VAE standard par le
-    super-résolution NVIDIA PiD (suppression d'artefacts & micro-textures).
-  ✦ Multi-LoRAs FLUX.2 :
-    Prise en charge des fichiers .safetensors compatibles FLUX.2. Changement de
-    slider en 0s (sans recharger le modèle).
-
---------------------------------------------------------------------------------
-2. Juggernaut XL Lightning (Moteur SDXL Distillé & Ultra-Rapide)
---------------------------------------------------------------------------------
-- Répertoire / ID : juggernaut-xl-lightning (RunDiffusion/Juggernaut-XL-Lightning)
-- Exécution       : venv-sdxl (Python 3.14 + MLX natif 4-bit)
-- Étapes idéales  : 4 steps | Scheduler : euler_trailing | Guidance : 1.0
-- Vitesse (M1)    : ⚡ ~15–20s en 1024×1024 (avec TAESD) | ~50s (VAE Natif)
-
-AVANTAGES CLÉS :
-  ✦ ⚡ Génération 4-step distilled SOTA :
-    Qualité photographique exceptionnelle sans compromis grâce à l'architecture
-    distillée 4 étapes de RunDiffusion.
-  ✦ ⚡⚡ Décodeur VAE TAESD ultra-rapide (~0.5s) :
-    Remplacement instantané du décodeur lourd par TAESD compilé en MLX pur,
-    éliminant 20 secondes d'attente à la fin de la génération.
-  ✦ Multi-LoRAs SDXL & Empilement Dynamique :
-    Chargement et fusion à la volée des LoRAs Kohya / CivitAI (format SDXL)
-    sans altérer les poids quantifiés du modèle de base.
-  ✦ Samplers Avancés & Support Negative Prompt :
-    euler_trailing (défaut optimisé 4-step), dpmpp_2m_karras, euler_a_substep,
-    euler_a, euler, ddim.
-
---------------------------------------------------------------------------------
-3. Krea 2 Turbo 13B (Moteur Photoréaliste Haute Fidélité)
---------------------------------------------------------------------------------
-- Répertoire / ID : krea2-turbo (local:krea2-turbo-q4)
-- Règle des Steps :
-  * SANS LoRA 4-step : DOIT TOURNER EN 8 STEPS (Défaut).
-    Sans le LoRA de distillation, 4 steps ne suffisent pas pour converger :
-    l'image reste floue, incomplète et bruitée. Le modèle natif requiert
-    impérativement 8 steps pour atteindre sa pleine netteté et convergence.
-  * AVEC LoRA 4-step : TOURNE EN 4 STEPS.
-    Si le LoRA de distillation (`Krea2-Turbo-Distill-4step`) est activé,
-    le modèle converge parfaitement en seulement 4 steps, réduisant le temps
-    de génération à ~140s au lieu de ~250s.
-- Résolution max  : 512×512 (recommandé) ou 512×768 (Portrait — limite mémoire 16GB)
-- Vitesse (M1)    : ~140s en 512×512 (4 steps avec LoRA) | ~250s (8 steps natif sans LoRA)
-
-AVANTAGES CLÉS :
-  ✦ Esthétique et Photoréalisme de pointe (Modèle 13B SOTA) :
-    Rendu bluffant des peaux, matières, lumières volumétriques et détails fins.
-  ✦ Quantification Q4 du Text Encoder Qwen3-VL :
-    Réduction dynamique de 7.5 GB à ~1.9 GB permettant de faire tourner un
-    modèle 13B complet sur Mac 16 GB unifiés.
-  ✦ Moteur Anti-SIGABRT :
-    Sécurisation des conversions de mémoire C/C++ pour empêcher tout crash
-    brutal du processus lors du décodage VAE causal 3D.
-  ✦ Règle de convergence 8 steps (natif) vs 4 steps (avec LoRA distillé) :
-    Garantit une netteté maximale et évite tout rendu inachevé.
-
---------------------------------------------------------------------------------
-4. Z-Image Turbo 6B (Moteur Rapide Grands Formats)
---------------------------------------------------------------------------------
-- Répertoire / ID : z-image-turbo (filipstrand/Z-Image-Turbo-mflux-4bit)
-- Étapes idéales  : 9 steps | Guidance : Non applicable
-- Vitesse (M1)    : ~40s en 1024×1024
-
-AVANTAGES CLÉS :
-  ✦ Idéal pour les esquisses rapides et les panoramas 16:9 (1280×720).
-  ✦ Empreinte mémoire ultra-légère.
+Ports (do not change — 8000 / 5173 are reserved by other local tools):
+- Backend  : 8001   (FastAPI, Swagger at http://localhost:8001/docs)
+- Frontend : 5174   (React/Vite studio at http://localhost:5174)
 
 
-================================================================================
-3. LE BOUTON "✨ ENHANCE" (AMÉLIORATION INTELLIGENTE DU PROMPT)
-================================================================================
+==========================================================================
+2. QUICK START (RECOMMENDED)
+==========================================================================
+From the project root, launch everything with one command:
 
-Situé juste à droite du champ de prompt dans l'interface, le bouton "✨ Enhance"
-est un optimiseur de prompt neuronal 100% local, alimenté par un modèle de langage
-embarqué (Qwen2.5-0.5B-Instruct-4bit via mlx-lm).
+    ./run.sh
 
-Il fonctionne entièrement hors-ligne sur Apple Silicon (Metal GPU), prend ~0.5 à 1s,
-consomme moins de 350 Mo de RAM, et n'envoie aucune donnée vers le cloud.
+run.sh will:
+1. free stuck processes on ports 8001 / 5174 if any,
+2. start the FastAPI backend (`venv/`) with caffeinate (keeps the Mac awake
+   during long renders),
+3. wait for the backend to be ready, then start the Vite frontend,
+4. open http://localhost:5174 in your default browser,
+5. stop backend + frontend + SDXL engine cleanly on Ctrl+C.
 
---------------------------------------------------------------------------------
-A) RÈGLES STRUCTURALES GUIDÉES PAR LE MODÈLE (Model-Guided Prompting)
---------------------------------------------------------------------------------
-Chaque famille de modèle possède son propre encodeur de texte (T5, dual-CLIP,
-Qwen3-VL, DiT). Le bouton Enhance adapte dynamiquement ses règles de réécriture
-selon le modèle sélectionné :
-
-1. FLUX.2-klein 4B (Encodeur T5) :
-   - Génère une prose narrative naturelle, fluide et descriptive (2 à 3 phrases).
-   - Décrit précisément la physique de la lumière (lumière rasante, diffusion douce,
-     reflets spéculaires), les textures matérielles réelles et l'optique caméra
-     (profondeur de champ, 50mm f/1.4).
-   - Proscrit formellement les mots-clés parasites / "tag soup" ("masterpiece",
-     "8k", "trending on artstation", "photorealistic").
-
-2. Juggernaut XL Lightning (Encodeurs CLIP-L + OpenCLIP-G) :
-   - Structure le prompt avec un vocabulaire cinématographique et photographique
-     percutant (medium shot, 35mm photography, volumetric lighting, rim light,
-     dramatic shadow contrast).
-   - Met en avant la séparation nette sujet/arrière-plan et la composition du cadre.
-
-3. Krea 2 Turbo 13B (Encodeur Multimodal Qwen3-VL) :
-   - Privilégie des angles de vue marqués et dynamiques (contre-plongée, grand-angle,
-     lignes de fuite), des contours nets et des palettes chromatiques vibrantes.
-
-4. Z-Image Turbo 6B (Transformer DiT) :
-   - Accentue le photoréalisme tactile, les micro-textures de surface (pores de
-     peau, tissage de tissu, gouttelettes) et la netteté chirurgicale du sujet.
-
---------------------------------------------------------------------------------
-B) PRÉSERVATION STRICTE DES TRIGGERS DE LoRA (LoRA Trigger Preservation)
---------------------------------------------------------------------------------
-Lorsque vous activez un ou plusieurs LoRAs dans la section "LoRAs" :
-
-1. Détection automatique :
-   Le backend consulte instantanément la base locale des LoRAs (`data/loras.json`)
-   et extrait tous les mots-clés d'activation officiels (trigger words) associés
-   aux LoRAs actuellement cochés / actifs.
-
-2. Intégration verbatim & naturelle :
-   - Si vous avez déjà tapé le trigger dans votre texte, Enhance le préserve
-     scrupuleusement à sa place et étoffe harmonieusement ce qui l'entoure.
-   - Si vous ne l'avez pas encore tapé, Enhance l'intègre directement et naturellement
-     dans la définition du sujet principal.
-   - L'ambiance générale générée par Enhance est harmonisée avec le thème du LoRA
-     (ex: cyberpunk, rétro, aquarelle, personnage spécifique).
-
-3. Garantie déterministe anti-omission :
-   Une étape de vérification post-génération contrôle automatiquement la présence
-   exacte de chaque trigger word. Si le modèle de langage a oublié un mot-clé, le
-   système le réinsère automatiquement au début du prompt enrichi.
-
---------------------------------------------------------------------------------
-C) DÉCHARGEMENT AUTOMATIQUE DES LoRAs AU CHANGEMENT DE MODÈLE
---------------------------------------------------------------------------------
-- Pour éviter les incohérences et les crashs de moteurs (ex: charger un LoRA Krea 2
-  ou SDXL dans FLUX.2 ou Z-Image Turbo), l'interface décharge automatiquement tout
-  LoRA incompatible dès que vous changez de modèle dans le sélecteur.
-- Si le modèle sélectionné ne supporte aucun LoRA ou ne dispose d'aucun LoRA
-  compatible dans la bibliothèque, la liste des LoRAs actifs se vide instantanément.
-- Le menu déroulant "+ Add LoRA..." ne propose que les LoRAs compatibles avec
-  l'architecture en cours d'utilisation.
-
---------------------------------------------------------------------------------
-D) COMMENT L'UTILISER ?
---------------------------------------------------------------------------------
-1. Écrivez simplement une idée courte dans le champ Prompt (ex: "a cybernetic cat").
-2. (Optionnel) Sélectionnez un ou plusieurs LoRAs compatibles dans la section LoRAs.
-3. Cliquez sur le bouton "✨ Enhance".
-4. En ~1 seconde, votre prompt est remplacé par une description experte, enrichie,
-   adaptée au modèle d'inférence en cours et contenant tous vos déclencheurs LoRA !
+One-time setup before the first run:
+    ./venv/bin/python -m pip install -r backend/requirements.txt
+    ./venv-sdxl/bin/python -m pip install -r backend/requirements-sdxl.txt
+    cd frontend && npm install && cd ..
 
 
-================================================================================
-4. OPTIONS AVANCÉES & FONCTIONNALITÉS STUDIO
-================================================================================
+==========================================================================
+3. DEVELOPMENT MODE (2 TERMINALS)
+==========================================================================
+Terminal 1 — Backend (hot reload):
+    ./dev-backend.sh
+    # equivalent: cd backend && ../venv/bin/uvicorn main:app --reload --port 8001
 
-- Studio Split-Screen  : Formulaire à gauche, grand Canvas interactif à droite.
-- Bouton "✨ Enhance"   : Amélioration neuronale locale 1-clic avec adaptation modèle
-                         et conservation garantie des triggers LoRA.
-- Upscaleur Neuronal   : Bouton "✨ AI Neural 2x" (SeedVR2 latent 1-step) et boutons
-                         "⚡ Fast 2x" / "⚡ Fast 4x" (Lanczos haute fidélité en 0.18s).
-- Variantes 1-Clic     : Boutons "Dice" (randomize), "+1 Seed" et "+1024 Batch Seed".
-- Galerie Lazy-Loaded  : Tri par date, tags personnalisés, recherche textuelle et
-                         miniatures WebP/PNG générées à la demande.
-- Drag & Drop Direct   : Glisser-déposer une image ou un fichier .safetensors dans
-                         le formulaire pour l'ajouter automatiquement aux références
-                         ou enregistrer le LoRA.
-- Réutilisation Réf    : Le bouton "🖼️ Use as Reference" dans le Canvas ou la Galerie
-                         envoie directement l'image dans le plateau multi-références.
-- Gestion Concurrence  : File d'attente FIFO unifiée avec option de bascule ou
-                         d'annulation instantanée en cas de nouvelle requête.
-================================================================================
+Terminal 2 — Frontend (hot reload):
+    cd frontend && npm run dev
+
+Note: the backend code is 100% live-reloaded on save. Settings are persisted
+in backend/data/settings.json (gitignored — never committed).
+
+Production build of the frontend:
+    cd frontend && npm run build        # outputs to frontend/dist
+
+
+==========================================================================
+4. STOPPING SERVICES
+==========================================================================
+Graceful: press Ctrl+C in each terminal (or in run.sh's terminal).
+
+Kill-everything one-liner (stuck daemons):
+    pkill -f "uvicorn main:app" ; pkill -f sdxl_engine.py ; pkill -f vite
+
+Free the ports directly:
+    lsof -ti :8001,5174 | xargs kill -9
+
+SDXL engine behavior: sdxl_engine.py runs as an isolated subprocess in
+venv-sdxl and kills itself after 5 min idle. To reclaim ~7–11 GB memory
+immediately:  pkill -f sdxl_engine.py
+
+
+==========================================================================
+5. SUPPORTED MODELS (ALL QUANTIZED FOR 16 GB UNIFIED MEMORY)
+==========================================================================
+1. FLUX.2-klein 4B  (main engine — Black Forest Labs DiT)
+   - id flux2-klein-4b  ·  ideal 4 steps  ·  guidance 1.0 (guidance-distilled,
+     NO negative prompt)
+   - ~90 s @ 768x768  ·  ~120–140 s @ 1024x1024 (M1)
+   - In-context multi-reference conditioning (1–10 images, referenced in the
+     prompt as "Image 1", "Image 2", …)
+   - Exact #HEX color matching + on-screen palette insertion
+   - Optional PiD VAE super-resolution decode (advanced settings)
+   - Multi-LoRA FLUX.2 (.safetensors), slider swap in 0s
+
+2. Juggernaut XL Lightning  (distilled SDXL, ultra-fast)
+   - id juggernaut-xl-lightning  (RunDiffusion)
+   - 4 steps  ·  euler_trailing  ·  guidance 1.0  ·  ~15–20 s @ 1024x1024 with TAESD
+   - ⚡ Fast TAESD VAE decode (~0.5 s) or native VAE
+   - Multi-LoRA Kohya/CivitAI with rank-concat stacking, samplers:
+     euler_trailing (default), dpmpp_2m_karras, euler_a_substep, euler_a,
+     euler, ddim  ·  full negative-prompt support
+
+3. Krea 2 Turbo 13B  (photorealistic)
+   - id krea2-turbo (local krea2-turbo-q4)
+   - WITHOUT distill LoRA : MUST run 8 steps (4 steps stay blurry)
+   - WITH Krea2-Turbo-Distill-4step LoRA : runs in 4 steps (~140 s vs ~250 s)
+   - max 512x512 recommended (512x768 portrait on 16 GB)
+   - Q4-quantized Qwen3-VL text encoder (7.5 GB → ~1.9 GB)
+
+4. Z-Image Turbo 6B  (fast, large formats)
+   - id z-image-turbo  (filipstrand)
+   - ~40 s @ 1024x1024  ·  great for 1280x720 16:9 sketches
+
+Swapping models automatically unloads incompatible LoRAs to avoid crashes.
+
+
+==========================================================================
+6. PROMPT ENHANCER ("✨ Enhance")
+==========================================================================
+Local 4-bit LLM (Qwen2.5-0.5B-Instruct via mlx-lm) — fully offline, ~0.5–1 s,
+<350 MB RAM, no cloud call.
+
+- Model-guided rewriting: rules adapt to each engine's text encoder
+  (T5 for FLUX.2, dual-CLIP for SDXL, Qwen3-VL for Krea, DiT for Z-Image).
+- LoRA trigger preservation: active LoRA trigger words are detected from
+  backend/data/loras.json, kept verbatim, and re-inserted deterministically
+  if the LLM drops one.
+- Editable system prompts: Settings → Prompt Enhancer lets you view and
+  customize each engine's guidance in two modes:
+  - Text mode — natural-language rewriting rules;
+  - JSON mode — the full instruction contract (engine guidance + schema
+    structure + fill-in guidelines), applied verbatim when you override it.
+
+The ✨ Enhance button sits right of the prompt field; it replaces the prompt
+with an enriched, engine-adapted description in ~1 s.
+
+
+==========================================================================
+7. LoRAs & CIVITAI IMPORT
+==========================================================================
+- Add LoRA: drag & drop a .safetensors onto the form, or use "+ Add LoRA…"
+  (only compatible architectures are offered).
+- Civitai import: paste any Civitai URL or numeric model ID; live progress
+  bar with speed and cancel (✕). Checkpoint files >2 GB and incompatible
+  architectures (SD1.5 / Flux.1) are rejected upfront.
+- Installed LoRAs Hub drawer: browse every installed LoRA across SDXL /
+  FLUX.2 / Krea / Z-Image, one-click "Switch to {Architecture}", delete 🗑️.
+- Multi-LoRA with rank-concat stacking (SDXL) and in-context multi-LoRA
+  (FLUX.2). Trigger words live in data/loras.json.
+
+Model install from an already-downloaded copy (no re-download):
+  In the installer, "📁 Local…" lets you register a model tree already on
+  disk — a folder on your disk OR a repo in the Hugging Face cache
+  (~/.cache/huggingface, models--org--name, auto-resolved to its latest
+  snapshot). Nothing is copied: the model loads directly from that path, the
+  installer marks it "installed", and RAM/disk usage reflect it. Uninstalling
+  only unlinks the pointer — your files stay on disk.
+
+
+==========================================================================
+8. STUDIO & GALLERY
+==========================================================================
+- Split-screen studio: generation form (left) + interactive canvas (right).
+- Upscaling: ✨ AI Neural 2x (SeedVR2 latent 1-step), ⚡ Fast 2x / ⚡ Fast 4x
+  (Lanczos, 0.18 s).
+- Variants: 🎲 randomize, +1 seed, +1024 batch seed.
+- Gallery (Browser tab): lazy-loaded thumbnails, date/tag/text search,
+  🖼️ "Use as Reference" re-injects any image into the multi-reference tray.
+- Civitai-compliant metadata: every PNG embeds prompt / negative / steps /
+  sampler / seed / CFG / checkpoint + AutoV2 hashes / LoRAs with version IDs
+  in tEXt + EXIF, generator "MLX-DIFFUSION" / artist "www.ouinche.com".
+  Fully readable by Civitai's upload parser.
+
+
+==========================================================================
+9. TROUBLESHOOTING
+==========================================================================
+| Symptom                                  | Fix                                                     |
+|------------------------------------------|---------------------------------------------------------|
+| Port 8001 / 5174 already in use          | lsof -ti :8001,5174 \| xargs kill -9                    |
+| MemoryError on LoRA load (HTML/corrupt)  | Delete via UI 🗑️ or DELETE /api/loras/{name}            |
+| Civitai 401 Unauthorized                 | Add token: UI API Key field or backend/data/civitai_token.txt |
+| Civitai "EXIF not found"                 | python backend/scripts/retroactive_civitai_metadata.py --all |
+| Sluggish / swap with both engines loaded | pkill -f sdxl_engine.py                                 |
+| Generation fails at step 0 (Metal FE)    | Run outside sandboxes; ensure Metal shader cache access |
+| First gen extremely slow                 | First run downloads ~2–3 GB weights (~20 min)           |
+
+==========================================================================
