@@ -81,6 +81,28 @@ Measured on the **2021 MacBook Pro M1 (16 GB)**, from the last 2 days of studio 
 
 ---
 
+## Model vs model — visual arena
+
+Head-to-head repeatability images (prompt: stormtrooper in a swiss alpine valley · seed **1337** · same prompt per pair). Static preview below; **interactive drag-comparison slider** lives in [`docs/model-arena/`](docs/model-arena/index.html) (open it in a browser).
+
+### 768 × 768 — FLUX.2-klein 4B vs Z-Image Turbo 6B (4 vs 8 steps)
+
+| FLUX.2-klein 4B (median 1:16) | Z-Image Turbo 6B (median 2:54) |
+|---|---|
+| ![FLUX.2-klein 4B, 768x768, seed 1337](docs/model-arena/images/flux2_klein_768.png) | ![Z-Image Turbo 6B, 768x768, seed 1337](docs/model-arena/images/z_image_768.png) |
+
+### 1024 × 1024 — FLUX.2-klein 4B vs Juggernaut XL Lightning vs Krea 2 Turbo
+
+| FLUX.2-klein 4B (median 2:03) | Juggernaut XL Lightning (median 1:07) | Krea 2 Turbo 13B (median 12:16*) |
+|---|---|---|
+| ![FLUX.2-klein 4B, 1024x1024, seed 1337](docs/model-arena/images/flux2_klein_1024.png) | ![Juggernaut XL Lightning, 1024x1024, seed 1337](docs/model-arena/images/juggernaut_1024.png) | ![Krea 2 Turbo 13B, 1024x1024, seed 1337](docs/model-arena/images/krea2_1024.png) |
+
+\* Krea 2 Turbo at 1024×1024 ran under elevated system load; its realistic sweet spot is 512×768 (2:51 median) or 512×512 (2:44).
+
+> For the full interactive model-by-model arena: open [`docs/model-arena/index.html`](docs/model-arena/index.html) in a browser.
+
+---
+
 ## Feature highlights
 
 - **✨ Prompt Enhancer** — local 4-bit LLM that rewrites prompts per-engine, preserves your LoRA trigger words verbatim (with a deterministic re-insertion guarantee), and offers editable per-engine system prompts in **text or JSON mode**.
