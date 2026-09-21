@@ -40,8 +40,8 @@ header {
 
 .app-logo {
   display: block;
-  width: 36px;
-  height: 36px;
+  width: 72px;
+  height: 72px;
   border-radius: 8px;
   object-fit: contain;
 }
