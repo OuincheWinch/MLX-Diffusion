@@ -185,3 +185,10 @@ Model install from an already-downloaded copy (no re-download):
 | First gen extremely slow                 | First run downloads ~2–3 GB weights (~20 min)           |
 
 ==========================================================================
+LICENSE
+==========================================================================
+MLX-DIFFUSION is released under the MIT License (see LICENSE file in the repo
+root). This license covers the source code only — it does NOT cover the model
+weights (FLUX.2-klein is Black Forest Labs Non-Commercial; other checkpoints
+carry their own terms) or third-party vendored content.
+==========================================================================
