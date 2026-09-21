@@ -118,7 +118,7 @@ export default function TokenManager({
       <TokenRow
         provider="civitai"
         label="Civitai"
-        placeholder="Civitai API Key (from civitai.com/user/account)"
+        placeholder="Civitai API Key (from civitai.red/?ref_code=88C8VEBA)"
         configured={civitaiConfigured}
         showInput={showCivitai}
         value={civitaiToken}

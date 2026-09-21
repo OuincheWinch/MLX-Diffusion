@@ -819,7 +819,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
               </select>
               {modelInfo?.civitai_version_id && (
                 <a
-                  href={`https://civitai.com/models/${modelInfo.civitai_model_id || ""}?modelVersionId=${modelInfo.civitai_version_id}`}
+                  href={`https://civitai.red/models/${modelInfo.civitai_model_id || ""}?modelVersionId=${modelInfo.civitai_version_id}&ref_code=88C8VEBA`}
                   target="_blank"
                   rel="noreferrer"
                   className="civitai-badge model-civitai-badge"

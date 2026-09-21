@@ -7,6 +7,18 @@ Benchmarked and tuned on a **2021 MacBook Pro M1 with 16 GB of Unified Memory** 
 
 ---
 
+## Screenshot tour
+
+| Generation page | Prompt enhancement |
+|---|---|
+| ![Generation page](frontend/src/assets/MLX-Diffusion_generation_page.png) | ![Prompt enhancement](frontend/src/assets/MLX-Diffusion_prompt_enhancement_page.png) |
+
+| Parameters | Browsing (gallery) |
+|---|---|
+| ![Parameters page](frontend/src/assets/MLX-Diffusion_parameters_page.png) | ![Browsing page](frontend/src/assets/MLX-Diffusion_browsing_page.png) |
+
+---
+
 ## Local by design — your privacy on your silicon
 
 Every part of the pipeline runs from your Mac's own memory:
@@ -15,8 +27,23 @@ Every part of the pipeline runs from your Mac's own memory:
 - **The prompt enhancer is a local LLM too** — a Qwen2.5-0.5B-Instruct 4-bit model (~350 MB RAM, sub-second latency) rewrites your prompts *on-device*.
 - **No telemetry, no API keys, no network calls at generation time.** The studio even works fully offline once the weights are cached in your local Hugging Face cache.
 - **Install from an already-downloaded copy** — register any model tree already on your disk (folder or HF cache) and it loads directly, nothing is re-downloaded or copied.
+- **No data leaves your computer while generating.** Prompts, images, LoRA weights and model weights are all processed and stored locally; the only moment any data is transmitted is when *you* actively upload or export an image online.
+- **Every image ships with its full generation record.** Each PNG embeds prompt, seed, steps, sampler, CFG, and model + LoRA names/hashes as `tEXt` + EXIF metadata — fully compliant with [Civitai](https://civitai.red/?ref_code=88C8VEBA)'s model/LoRA detection, so the exact checkpoint and LoRAs are recognised automatically when you upload.
 
 The M1 (2021) runs this comfortably because of unified memory: the CPU and GPU share one pooled 16 GB pool, so the whole quantized model stays resident and there is no CPU-GPU copying — exactly what MLX exploits.
+
+---
+
+## API tokens — smoother downloads
+
+No account is required to generate — everything runs offline. **Two optional tokens** make download integration buttery-smooth when you *do* reach for the network:
+
+| Token | Why it helps | Where to set it |
+|---|---|---|
+| **[Civitai](https://civitai.red/?ref_code=88C8VEBA) API key** | Resume-able LoRA/bundle downloads straight from Civitai; some model versions are auth-gated and need it | Settings → Tokens, or env `CIVITAI_API_KEY` |
+| **Hugging Face token** | Unlocks gated/private models and skips rate-limit hiccups on first-weight downloads (~2–3 GB) | Settings → Tokens, or env `HF_TOKEN` (or `huggingface-cli login`) |
+
+> Neither token is ever sent anywhere except the service it belongs to, and tokens stay in `backend/data/` on your disk.
 
 ---
 
@@ -122,10 +149,10 @@ Head-to-head repeatability comparisons from the 11-prompt benchmarking suite (or
 ## Feature highlights
 
 - **✨ Prompt Enhancer** — local 4-bit LLM that rewrites prompts per-engine, preserves your LoRA trigger words verbatim (with a deterministic re-insertion guarantee), and offers editable per-engine system prompts in **text or JSON mode**.
-- **Multi-LoRA** — FLUX.2 and SDXL LoRA support, drag-and-drop `.safetensors`, rank-concat stacking for SDXL, and a built-in **Civitai importer** with live progress, speed, and cancel.
+- **Multi-LoRA** — FLUX.2 and SDXL LoRA support, drag-and-drop `.safetensors`, rank-concat stacking for SDXL, and a built-in [Civitai](https://civitai.red/?ref_code=88C8VEBA) importer with live progress, speed, and cancel.
 - **In-context multi-reference** — condition FLUX.2 on 1–10 reference images by referencing them as `Image 1`, `Image 2`, … in the prompt.
 - **Exact color control** — strict `#HEX` palette matching with an in-app visual palette.
-- **Civitai-compliant metadata** — every PNG embeds prompt, seed, steps, sampler, CFG, checkpoint and LoRA hashes in `tEXt` + EXIF, fully parseable by Civitai's uploader.
+- **Civitai-compliant metadata** — every PNG embeds prompt, seed, steps, sampler, CFG, checkpoint and LoRA hashes in `tEXt` + EXIF, fully parseable by [Civitai](https://civitai.red/?ref_code=88C8VEBA)'s uploader for automatic model/LoRA detection.
 - **Split-screen studio & gallery** — left form / right interactive canvas, lazy-loaded gallery with tags, text search and one-click "Use as Reference", plus a local **2x/4x upscaler** (Lanczos) and **AI neural 2x** (SeedVR2).
 
 ---

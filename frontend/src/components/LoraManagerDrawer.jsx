@@ -116,7 +116,7 @@ export default function LoraManagerDrawer({
               )}
               {civitaiId && (
                 <a
-                  href={`https://civitai.com/models/${civitaiModelId || ""}?modelVersionId=${civitaiId}`}
+                  href={`https://civitai.red/models/${civitaiModelId || ""}?modelVersionId=${civitaiId}&ref_code=88C8VEBA`}
                   target="_blank"
                   rel="noreferrer"
                   className="civitai-badge"
