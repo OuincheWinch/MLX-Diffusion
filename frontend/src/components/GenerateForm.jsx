@@ -1,0 +1,1095 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../api";
+import GenerationStack from "./GenerationStack";
+import ResultCanvas from "./ResultCanvas";
+import UniversalDownloader from "./UniversalDownloader";
+import LoraManagerDrawer from "./LoraManagerDrawer";
+import ModelInstaller from "./ModelInstaller";
+import GenerationParams from "./GenerationParams";
+import { findLoraEntry, getModelBase, isKreaDistillLora } from "../utils/loraUtils";
+import { useGenerationJob } from "../hooks/useGenerationJob";
+import { useModelConfig } from "../hooks/useModelConfig";
+import { useLoraPanel } from "../hooks/useLoraPanel";
+import { useSettings } from "../hooks/useSettings";
+
+function getNextSeed(currentSeed) {
+  if (currentSeed != null && currentSeed !== "" && !isNaN(Number(currentSeed))) {
+    return Number(currentSeed) + 1;
+  }
+  return Math.floor(Date.now() % 1000000);
+}
+
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const KREA_DISTILL_FALLBACK_PATH =
+  "/Volumes/Externe/IA/MLX-DIFFUSION OpenCode/backend/data/lora_files/krea2_turbo_4step_rank_64_lora_latest.safetensors";
+
+function kreaDistillUpdater(steps, registry) {
+  if (steps > 4) {
+    return (prev) => prev.filter((l) => !(isKreaDistillLora(l) && l.autoDistill));
+  }
+  const regEntry = (registry || []).find(
+    (l) => l.base_model === "krea2" && isKreaDistillLora(l)
+  );
+  const path = regEntry?.path || KREA_DISTILL_FALLBACK_PATH;
+  const name = regEntry?.name || "krea2_turbo_4step_rank_64_lora_latest";
+  return (prev) => {
+    if (prev.some(isKreaDistillLora)) return prev;
+    return [...prev, { path, scale: 1.0, name, base_model: "krea2", autoDistill: true }];
+  };
+}
+
+const HEX_PALETTE = [
+  { name: "Neon Pink", hex: "#FF3366" },
+  { name: "Cyber Cyan", hex: "#00E5FF" },
+  { name: "Cyber Gold", hex: "#FFD700" },
+  { name: "Electric Violet", hex: "#7928CA" },
+  { name: "Neon Green", hex: "#00FF66" },
+  { name: "Tangerine", hex: "#FF5500" },
+  { name: "Pure White", hex: "#FFFFFF" },
+  { name: "Matte Black", hex: "#111111" },
+  { name: "Royal Blue", hex: "#2E5BFF" },
+  { name: "Lavender", hex: "#E056FD" },
+  { name: "Crimson", hex: "#FF0033" },
+  { name: "Emerald", hex: "#00B894" },
+];
+
+export default function GenerateForm({ onGenerated, initialParams, onModelChange, onImageSaved }) {
+  const {
+    jobId,
+    status,
+    jobPhase,
+    jobPhaseDetail,
+    progress,
+    error,
+    setError,
+    generatingPrompt,
+    currentResult,
+    setCurrentResult,
+    batchResults,
+    setBatchResults,
+    submittedParams,
+    setSubmittedParams,
+    showSwitchDialog,
+    setShowSwitchDialog,
+    activateJob,
+    cancelJob,
+  } = useGenerationJob({ onGenerated, onImageSaved });
+
+  const {
+    models,
+    model,
+    setModel,
+    modelInfo,
+    refreshModels,
+  } = useModelConfig({ onModelChange });
+
+  const { settings: appSettings } = useSettings();
+
+  // Single source of truth for the app header title: keep it in sync with the
+  // model that is actually selected (covers model changes from "Reuse params"
+  // in the Browser tab, which updates `model` without going through switchModel).
+  useEffect(() => {
+    if (modelInfo?.label) onModelChange?.(modelInfo.label);
+  }, [modelInfo?.label, onModelChange]);
+
+  const {
+    loras,
+    setLoras,
+    loraRegistry,
+    setLoraRegistry,
+    newLora,
+    setNewLora,
+    savingLora,
+    uploadProgress,
+    activeTriggerWords,
+    uploadLoraFile,
+    saveNewLora,
+  } = useLoraPanel({ onError: setError });
+
+  const [prompt, setPrompt] = useState("");
+  const [width, setWidth] = useState(1024);
+  const [height, setHeight] = useState(1024);
+  const [steps, setSteps] = useState(4);
+  const [guidance, setGuidance] = useState(1.0);
+  const [seed, setSeed] = useState("");
+  const [batch, setBatch] = useState(1);
+  const [negativePrompt, setNegativePrompt] = useState("");
+  const [sampler, setSampler] = useState("euler_trailing");
+  const [cacheInterval, setCacheInterval] = useState(1);
+  const [dragOver, setDragOver] = useState(false);
+
+  const promptRef = useRef(null);
+  const [refImages, setRefImages] = useState([]); // [{id, path, preview, name}]
+  const [refStrength, setRefStrength] = useState(0.6);
+  const [showColorPicker, setShowColorPicker] = useState(false);
+  const [customHex, setCustomHex] = useState("#FF3366");
+  const [outputFormat, setOutputFormat] = useState("png");
+  const [stealthMode, setStealthMode] = useState(false);
+  const [fastVae, setFastVae] = useState(true);
+  const [enhancing, setEnhancing] = useState(false);
+  const [enhanceJson, setEnhanceJson] = useState(false);
+  const [showEnhanceWarning, setShowEnhanceWarning] = useState(false);
+  const enhanceAbortRef = useRef(null);
+
+  useEffect(() => () => enhanceAbortRef.current?.abort(), []);
+
+
+
+  useEffect(() => {
+    if (initialParams) {
+      setPrompt(initialParams.prompt ?? "");
+      const matched = models.find(
+        (m) => m.id === initialParams.model || m.repo === initialParams.model
+      );
+      const targetId = matched?.id ?? (models.some((m) => m.id === initialParams.model) ? initialParams.model : (initialParams.model || "flux2-klein-4b"));
+      setModel(targetId);
+      setWidth(initialParams.width ?? 1024);
+      setHeight(initialParams.height ?? 1024);
+      setSteps(initialParams.steps ?? (targetId === "z-image-turbo" || targetId === "krea2-turbo" ? 8 : 4));
+      if (initialParams.guidance != null) setGuidance(initialParams.guidance);
+      setSeed(initialParams.seed ?? "");
+      setLoras(initialParams.loras ?? []);
+      if (initialParams.id) {
+        setCurrentResult(initialParams);
+      }
+      if (initialParams.reference_images && Array.isArray(initialParams.reference_images)) {
+        setRefImages(
+          initialParams.reference_images.map((p) => ({
+            id: crypto.randomUUID(),
+            path: p,
+            preview: p.startsWith("http") || p.startsWith("/") ? p : `/api/images/${p.replace(/\.png$/, "")}/file?thumb=true`,
+            name: p.split("/").pop(),
+          }))
+        );
+      } else if (initialParams.reference_image) {
+        const p = initialParams.reference_image;
+        setRefImages([
+          {
+            id: crypto.randomUUID(),
+            path: p,
+            preview: p.startsWith("http") || p.startsWith("/") ? p : `/api/images/${p.replace(/\.png$/, "")}/file?thumb=true`,
+            name: p.split("/").pop(),
+          },
+        ]);
+      }
+      if (initialParams.format) setOutputFormat(initialParams.format);
+      if (initialParams.stealth != null) setStealthMode(Boolean(initialParams.stealth));
+      if (initialParams.fast_vae != null) setFastVae(Boolean(initialParams.fast_vae));
+      if (initialParams.sampler && matched?.samplers?.includes(initialParams.sampler)) {
+        setSampler(initialParams.sampler);
+      }
+    }
+  }, [initialParams, models]);
+
+  // Apply saved global defaults to a freshly-mounted (empty) form once.
+  const defaultsApplied = useRef(false);
+  useEffect(() => {
+    if (defaultsApplied.current || initialParams) return;
+    if (!appSettings) return;
+    defaultsApplied.current = true;
+    setOutputFormat(appSettings.default_output_format || "png");
+    setStealthMode(Boolean(appSettings.default_stealth));
+    setFastVae(appSettings.default_fast_vae != null ? Boolean(appSettings.default_fast_vae) : true);
+    if (appSettings.default_sampler) setSampler(appSettings.default_sampler);
+  }, [appSettings, initialParams]);
+
+  // Reactive Guard: Ensure active LoRAs are strictly compatible with the current model
+  useEffect(() => {
+    if (!loraRegistry || !loraRegistry.length) return;
+    const currentBase = getModelBase(modelInfo, model);
+    const supportsLoras = Boolean(modelInfo?.supports_loras || modelInfo?.lora_format);
+
+    setLoras((currentLoras) => {
+      if (!supportsLoras || !currentBase) {
+        return currentLoras.length > 0 ? [] : currentLoras;
+      }
+      const filtered = currentLoras.filter((l) => {
+        const entry = findLoraEntry(l, loraRegistry);
+        const lBase = l.base_model || entry?.base_model;
+        if (!lBase) return true;
+        return lBase === currentBase;
+      });
+      return filtered.length !== currentLoras.length ? filtered : currentLoras;
+    });
+  }, [model, modelInfo, loraRegistry]);
+
+  function toggleTriggerWord(word) {
+    if (!word) return;
+    const regex = new RegExp(`(^|\\s|,)${escapeRegExp(word)}($|\\s|,)`, "i");
+    if (regex.test(prompt)) {
+      const updated = prompt
+        .replace(regex, " ")
+        .replace(/,\s*,/g, ",")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      setPrompt(updated);
+    } else {
+      const trimmed = prompt.trim();
+      const updated = trimmed
+        ? `${trimmed.replace(/,+$/, "")}, ${word}`
+        : word;
+      setPrompt(updated);
+    }
+  }
+
+  function switchModel(id) {
+    setModel(id);
+    const m = models.find((x) => x.id === id);
+    if (!m) return;
+    onModelChange?.(m.label);
+    const defSteps = m.default_steps ?? (id === "z-image-turbo" || id === "krea2-turbo" ? 8 : 4);
+    setSteps(defSteps);
+    if (m.presets && m.presets.length > 0) {
+      if ((m.max_pixels && width * height > m.max_pixels) || id === "krea2-turbo" || id === "z-image-turbo") {
+        setWidth(m.presets[0].width);
+        setHeight(m.presets[0].height);
+        setSteps(m.default_steps ?? (id === "z-image-turbo" || id === "krea2-turbo" ? 8 : m.presets[0].steps));
+      }
+    }
+    // drop LoRAs incompatible with the new engine
+    const targetBase = getModelBase(m, id);
+    const supportsLoras = Boolean(m?.supports_loras || m?.lora_format);
+    if (!supportsLoras || !targetBase) {
+      setLoras([]);
+      if (id === "krea2-turbo" || id === "z-image-turbo") setSteps(m.default_steps ?? 8);
+    } else {
+      setLoras((ls) => {
+        const kept = ls.filter((l) => {
+          const entry = findLoraEntry(l, loraRegistry);
+          const lBase = entry?.base_model || l.base_model;
+          return lBase === targetBase;
+        });
+        if (id === "krea2-turbo") {
+          const has4Step = kept.some(isKreaDistillLora);
+          setSteps(has4Step ? 4 : 8);
+        } else if (id === "z-image-turbo") {
+          setSteps(8);
+        }
+        return kept;
+      });
+    }
+    if (m.samplers && m.samplers.length > 0) {
+      setSampler((prev) => {
+        if (m.default_sampler && m.samplers.includes(m.default_sampler)) return m.default_sampler;
+        return m.samplers.includes(prev) ? prev : m.samplers[0];
+      });
+    }
+    if (m.default_cache_interval != null) setCacheInterval(m.default_cache_interval);
+    if (m.default_fast_vae != null) setFastVae(Boolean(m.default_fast_vae));
+    if (!m.supports_guidance && m.default_guidance == null) return;
+    if (m.supports_guidance && m.default_guidance != null) setGuidance(m.default_guidance);
+  }
+
+  // Ensure default steps for z-image-turbo is 8 if currently 9
+  useEffect(() => {
+    if (model === "z-image-turbo" && steps === 9) {
+      setSteps(8);
+    }
+  }, [model, steps]);
+
+  // Support loading recovered prompts into form
+  useEffect(() => {
+    function handleLoadPrompt(e) {
+      const p = e.detail;
+      if (!p) return;
+      if (p.prompt != null) setPrompt(p.prompt);
+      if (p.negative_prompt != null) setNegativePrompt(p.negative_prompt);
+      if (p.model) switchModel(p.model);
+      if (p.seed != null) setSeed(p.seed);
+      if (p.width != null) setWidth(p.width);
+      if (p.height != null) setHeight(p.height);
+      if (p.steps != null) setSteps(p.steps);
+      if (p.guidance != null) setGuidance(p.guidance);
+      if (p.batch != null) setBatch(p.batch);
+      if (p.sampler != null) setSampler(p.sampler);
+      if (p.fast_vae != null) setFastVae(p.fast_vae);
+      if (Array.isArray(p.loras)) setLoras(p.loras);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+    window.addEventListener("mlx:load-prompt", handleLoadPrompt);
+    return () => window.removeEventListener("mlx:load-prompt", handleLoadPrompt);
+  }, [switchModel]);
+
+  // Reactive sync for Krea 2 Turbo:
+  // When steps <= 4, automatically pop 4-step distillation LoRA into parameters.
+  // When steps > 4, auto-detach any auto-injected distillation LoRA.
+  useEffect(() => {
+    if (model !== "krea2-turbo") return;
+    setLoras(kreaDistillUpdater(steps, loraRegistry));
+  }, [model, steps, loraRegistry]);
+
+  function fmt(s) {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+  }
+
+  const supportsMultiRef = Boolean(modelInfo.supports_multi_reference || model === "flux2-klein-4b" || model === "flux2-klein-9b");
+  const maxRefImages = modelInfo.max_reference_images ?? (supportsMultiRef ? 10 : 1);
+  const supportsRef = supportsMultiRef || model === "z-image-turbo" || Boolean(modelInfo.supports_ref);
+
+  const currentParams = () =>
+    JSON.stringify({
+      prompt,
+      model,
+      width: Number(width),
+      height: Number(height),
+      steps: Number(steps),
+      guidance: modelInfo.supports_guidance ? Number(guidance) : null,
+      seed: seed === "" ? null : Number(seed),
+      quantization: 4,
+      batch: Number(batch),
+      negative_prompt: modelInfo.supports_negative ? negativePrompt : "",
+      sampler: modelInfo.samplers ? sampler : undefined,
+      cache_interval: modelInfo.engine === "sdxl" ? Number(cacheInterval) : 1,
+      loras: (modelInfo.supports_loras || model === "flux2-klein-4b" || model === "flux2-klein-9b" ? [...loras].sort((x, y) => x.path.localeCompare(y.path)) : []).slice(0, 16),
+      reference_images: supportsRef ? refImages.map((img) => img.path) : [],
+      reference_strength: supportsRef && refImages.length > 0 && !supportsMultiRef ? Number(refStrength) : undefined,
+      output_format: outputFormat,
+      stealth: stealthMode,
+      fast_vae: fastVae,
+    });
+
+  async function runEnhancePrompt() {
+    if (!prompt.trim() || enhancing) return;
+    setEnhancing(true);
+    setError(null);
+    const controller = new AbortController();
+    enhanceAbortRef.current = controller;
+    try {
+      const res = await api("/api/prompt/enhance", {
+        method: "POST",
+        signal: controller.signal,
+        body: JSON.stringify({ prompt, model, loras, format: enhanceJson ? "json" : "text" }),
+      });
+      if (res?.enhanced) {
+        setPrompt(res.enhanced);
+      }
+    } catch (e) {
+      if (e?.name === "AbortError") {
+        // Cancelled by the user — leave the prompt untouched.
+      } else {
+        console.error("Enhance prompt error:", e);
+        setError(`Prompt enhancer: ${e.message}`);
+      }
+    } finally {
+      if (enhanceAbortRef.current === controller) enhanceAbortRef.current = null;
+      setEnhancing(false);
+    }
+  }
+
+  function handleEnhancePrompt() {
+    if (!prompt.trim() || enhancing) return;
+    // Enhancing during a running generation / model load competes for the same
+    // GPU + unified memory, so warn about the slowdown before starting.
+    if (busy) {
+      setShowEnhanceWarning(true);
+      return;
+    }
+    runEnhancePrompt();
+  }
+
+  function cancelEnhancePrompt() {
+    enhanceAbortRef.current?.abort();
+    enhanceAbortRef.current = null;
+    setEnhancing(false);
+  }
+
+  function removeRefImage(index) {
+    setRefImages((prev) => {
+      const target = prev[index];
+      if (target?.preview && target.preview.startsWith("blob:")) {
+        URL.revokeObjectURL(target.preview);
+      }
+      return prev.filter((_, i) => i !== index);
+    });
+  }
+
+  function addRefImage(item) {
+    setRefImages((prev) => {
+      if (prev.length >= maxRefImages) return prev;
+      if (prev.some((x) => x.path === item.path)) return prev;
+      return [...prev, item];
+    });
+  }
+
+  const isImageFile = (f) =>
+    Boolean((f.type && f.type.startsWith("image/")) || /\.(heic|heif|png|jpe?g|webp)$/i.test(f.name || ""));
+
+  async function uploadImageFiles(files) {
+    const list = Array.from(files).filter(isImageFile);
+    if (!list.length) return;
+    const remainingSlots = Math.max(0, maxRefImages - refImages.length);
+    const toUpload = list.slice(0, remainingSlots);
+    for (const file of toUpload) {
+      const form = new FormData();
+      form.append("file", file);
+      try {
+        const res = await api("/api/uploads", { method: "POST", body: form });
+        const isHeic = /\.(heic|heif)$/i.test(file.name || "");
+        // Use res.url (served as PNG by backend) for HEIC and when available so all browsers render it
+        const previewUrl = res.url || (isHeic ? "" : URL.createObjectURL(file));
+        setRefImages((prev) => {
+          if (prev.length >= maxRefImages) return prev;
+          return [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              path: res.path,
+              preview: previewUrl,
+              name: file.name,
+            },
+          ];
+        });
+      } catch (err) {
+        setError(`Reference upload failed: ${err.message || err}`);
+      }
+    }
+  }
+
+  async function pickRefImages(e) {
+    if (e.target.files?.length) {
+      await uploadImageFiles(e.target.files);
+      e.target.value = "";
+    }
+  }
+
+  async function handleDrop(e) {
+    e.preventDefault();
+    setDragOver(false);
+    const files = Array.from(e.dataTransfer?.files || []);
+    if (!files.length) return;
+    const loraFile = files.find((f) => f.name.endsWith(".safetensors"));
+    if (loraFile) {
+      await uploadLoraFile(loraFile);
+      return;
+    }
+    const imgFiles = files.filter(isImageFile);
+    if (imgFiles.length > 0) {
+      await uploadImageFiles(imgFiles);
+    }
+  }
+
+  function insertIntoPrompt(text) {
+    const el = promptRef.current;
+    if (!el) {
+      setPrompt((prev) => (prev ? `${prev.trim()} ${text}` : text));
+      return;
+    }
+    const start = el.selectionStart ?? el.value.length;
+    const end = el.selectionEnd ?? el.value.length;
+    const before = el.value.substring(0, start);
+    const after = el.value.substring(end);
+    const padBefore = before.length > 0 && !before.endsWith(" ") ? " " : "";
+    const padAfter = after.length > 0 && !after.startsWith(" ") ? " " : "";
+    const newPrompt = `${before}${padBefore}${text}${padAfter}${after}`;
+    setPrompt(newPrompt);
+    setTimeout(() => {
+      el.focus();
+      const newPos = start + padBefore.length + text.length;
+      el.setSelectionRange(newPos, newPos);
+    }, 0);
+  }
+
+  const detectedColors = useMemo(() => {
+    const matches = prompt.match(/#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b/g);
+    return matches ? [...new Set(matches.map((c) => c.toUpperCase()))] : [];
+  }, [prompt]);
+
+  function removeColorFromPrompt(hex) {
+    const regex = new RegExp(`\\s*${hex}\\b`, "gi");
+    setPrompt((prev) => prev.replace(regex, "").replace(/\s{2,}/g, " ").trim());
+  }
+
+  function getContrastColor(hex) {
+    const clean = hex.replace("#", "");
+    const full = clean.length === 3 ? clean.split("").map((c) => c + c).join("") : clean;
+    const r = parseInt(full.substring(0, 2), 16) || 0;
+    const g = parseInt(full.substring(2, 4), 16) || 0;
+    const b = parseInt(full.substring(4, 6), 16) || 0;
+    const yiq = (r * 299 + g * 587 + b * 114) / 1000;
+    return yiq >= 128 ? "#111" : "#fff";
+  }
+
+  async function postGenerate(isQueued = false) {
+    const paramsStr = currentParams();
+    let parsedPrompt = prompt;
+    try {
+      const parsed = JSON.parse(paramsStr);
+      if (parsed.prompt) parsedPrompt = parsed.prompt;
+    } catch {}
+
+    const res = await api("/api/generate", {
+      method: "POST",
+      body: paramsStr,
+    });
+    const { job_id } = res;
+    if (!isQueued) {
+      activateJob(job_id, parsedPrompt);
+    }
+    return job_id;
+  }
+
+  async function handleVariation(meta) {
+    if (!meta) return;
+    const newSeed = getNextSeed(meta.seed ?? seed);
+    setSeed(newSeed);
+    try {
+      const payload = {
+        ...JSON.parse(currentParams()),
+        prompt: meta.prompt || prompt,
+        seed: newSeed,
+      };
+      setSubmittedParams(JSON.stringify(payload));
+      const res = await api("/api/generate", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const { job_id } = res;
+      activateJob(job_id, payload.prompt);
+    } catch (err) {
+      setError(String(err.message || err));
+    }
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    setError(null);
+    if (busy) {
+      if (dirty) setShowSwitchDialog(true);
+      return;
+    }
+    try {
+      setSubmittedParams(currentParams());
+      await postGenerate(false);
+    } catch (err) {
+      setError(String(err.message || err));
+    }
+  }
+
+  async function queueNext() {
+    setShowSwitchDialog(false);
+    setSubmittedParams(currentParams());
+    try {
+      await postGenerate(true);
+    } catch (err) {
+      setError(String(err.message || err));
+    }
+  }
+
+  async function stopAndSwitch() {
+    setShowSwitchDialog(false);
+    try {
+      await cancelJob();
+    } catch {}
+    setSubmittedParams(currentParams());
+    try {
+      await postGenerate(false);
+    } catch (err) {
+      setError(String(err.message || err));
+    }
+  }
+
+  function switchToLoraModel(baseModel, loraEntry) {
+    const targetModel = models.find((m) => getModelBase(m, m.id) === baseModel);
+    if (targetModel) {
+      switchModel(targetModel.id);
+      if (loraEntry?.path) {
+        setTimeout(() => {
+          setLoras([{ path: loraEntry.path, scale: loraEntry.scale ?? 1.0, name: loraEntry.name, base_model: loraEntry.base_model }]);
+        }, 50);
+      }
+    }
+  }
+
+  const busy = jobId !== null;
+  const engineLoading =
+    busy && ["downloading", "loading_model", "compiling", "preparing"].includes(jobPhase);
+  const engineBase = getModelBase(modelInfo, model);
+  const compatibleLoras = engineBase && (modelInfo.supports_loras || modelInfo.lora_format)
+    ? loraRegistry.filter((r) => r.base_model === engineBase)
+    : [];
+  const dirty =
+    busy &&
+    submittedParams !== null &&
+    currentParams() !== submittedParams;
+
+  const PRESETS = Object.fromEntries(
+    (modelInfo.presets.length
+      ? modelInfo.presets
+      : [{ id: "default", label: "Default", width: 1024, height: 1024, steps: modelInfo.default_steps }]
+    ).map((p) => [p.id, p])
+  );
+  const activePreset =
+    Object.entries(PRESETS).find(
+      ([, p]) =>
+        p.width === Number(width) &&
+        p.height === Number(height) &&
+        p.steps === Number(steps) &&
+        (p.sampler === undefined || p.sampler === sampler) &&
+        (p.cache_interval === undefined || p.cache_interval === cacheInterval)
+    )?.[0] ?? null;
+
+  return (
+    <div className="studio-layout">
+      <div className="studio-form-pane">
+        <form
+          className={`generate-form${dragOver ? " drag-active" : ""}`}
+          onSubmit={submit}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+        >
+          <div className="prompt-toolbar">
+            <div className="prompt-toolbar-left">
+              {activeTriggerWords.length > 0 && (
+                <div className="trigger-chips-bar">
+                  <span className="trigger-chips-label">LoRA:</span>
+                  <div className="trigger-chips-list">
+                    {activeTriggerWords.map((tw) => {
+                      const inPrompt = new RegExp(`(^|\\s|,)${escapeRegExp(tw)}($|\\s|,)`, "i").test(prompt);
+                      return (
+                        <button
+                          key={tw}
+                          type="button"
+                          className={`trigger-chip${inPrompt ? " active" : ""}`}
+                          onClick={() => toggleTriggerWord(tw)}
+                          title={inPrompt ? "Click to remove from prompt" : "Click to add to prompt"}
+                        >
+                          {inPrompt ? `✓ ${tw}` : `+ ${tw}`}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+              {refImages.length > 0 && (
+                <div className="ref-quick-chips">
+                  <span className="ref-chips-label">Ref tags:</span>
+                  {refImages.map((_, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      className="ref-tag-chip"
+                      onClick={() => insertIntoPrompt(`Image ${i + 1}`)}
+                      title={`Insert "Image ${i + 1}" at cursor`}
+                    >
+                      + Image {i + 1}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="prompt-toolbar-right">
+              <button
+                type="button"
+                className="color-tool-btn"
+                onClick={handleEnhancePrompt}
+                disabled={enhancing || !prompt.trim()}
+                title="Adaptive AI Prompt Enhancer (Qwen 0.5B local LLM)"
+              >
+                {enhancing ? "✨ Enhancing…" : "✨ Enhance"}
+              </button>
+              {enhancing && (
+                <button
+                  type="button"
+                  className="color-tool-btn enhance-cancel-btn"
+                  onClick={cancelEnhancePrompt}
+                  title="Cancel prompt enhancement"
+                >
+                  ✕ Cancel
+                </button>
+              )}
+              <button
+                type="button"
+                className={`color-tool-btn${enhanceJson ? " active" : ""}`}
+                onClick={() => setEnhanceJson((prev) => !prev)}
+                title="Enhance as structured JSON prompt (subject / appearance / action / setting / lighting / atmosphere / composition / details / text_elements / technical / trigger_word)"
+              >
+                {"{ } JSON"}
+              </button>
+              <button
+                type="button"
+                className={`color-tool-btn${showColorPicker ? " active" : ""}`}
+                onClick={() => setShowColorPicker((prev) => !prev)}
+                title="Exact Color Matching (#HEX)"
+              >
+                🎨 Color #{customHex.slice(1)}
+              </button>
+            </div>
+          </div>
+
+          {showColorPicker && (
+            <div className="color-popover">
+              <div className="color-popover-header">
+                <span className="color-popover-title">FLUX.2 Exact Color Matching (#HEX)</span>
+                <button
+                  type="button"
+                  className="btn-mini"
+                  onClick={() => setShowColorPicker(false)}
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="color-swatch-grid">
+                {HEX_PALETTE.map((c) => (
+                  <button
+                    key={c.hex}
+                    type="button"
+                    className="color-swatch-btn"
+                    style={{ backgroundColor: c.hex, color: getContrastColor(c.hex) }}
+                    onClick={() => insertIntoPrompt(c.hex)}
+                    title={`${c.name} (${c.hex}) - Click to insert into prompt`}
+                  >
+                    {c.name}
+                  </button>
+                ))}
+              </div>
+              <div className="custom-color-row">
+                <input
+                  type="color"
+                  value={customHex}
+                  onChange={(e) => setCustomHex(e.target.value.toUpperCase())}
+                  title="Pick custom color"
+                />
+                <input
+                  type="text"
+                  value={customHex}
+                  onChange={(e) => setCustomHex(e.target.value.toUpperCase())}
+                  placeholder="#FFFFFF"
+                  maxLength={7}
+                  className="hex-input"
+                />
+                <button
+                  type="button"
+                  className="btn-mini btn-color-insert"
+                  onClick={() => insertIntoPrompt(customHex)}
+                >
+                  + Insert #{customHex.replace("#", "")}
+                </button>
+              </div>
+            </div>
+          )}
+
+          <textarea
+            ref={promptRef}
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Describe the image to generate... (or drag & drop an image/LoRA here)"
+            rows={4}
+            required
+          />
+
+          {detectedColors.length > 0 && (
+            <div className="active-hex-bar">
+              <span className="active-hex-label">Active #HEX Colors:</span>
+              <div className="active-hex-list">
+                {detectedColors.map((hex) => (
+                  <span
+                    key={hex}
+                    className="active-hex-badge"
+                    style={{ backgroundColor: hex, color: getContrastColor(hex) }}
+                    title="Click to remove from prompt"
+                    onClick={() => removeColorFromPrompt(hex)}
+                  >
+                    {hex} <span className="badge-remove">✕</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="preset-row">
+            <div className="model-select-group">
+              <select
+                className="model-select"
+                value={model}
+                onChange={(e) => switchModel(e.target.value)}
+              >
+                {(models.length ? models : [modelInfo]).map((m) => (
+                  <option key={m.id} value={m.id} className={m.installed ? "" : "model-option-offline"}>
+                    {m.installed === false ? "⬇ " : ""}{m.label}
+                  </option>
+                ))}
+              </select>
+              {modelInfo?.civitai_version_id && (
+                <a
+                  href={`https://civitai.com/models/${modelInfo.civitai_model_id || ""}?modelVersionId=${modelInfo.civitai_version_id}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="civitai-badge model-civitai-badge"
+                  title={`Civitai Model #${modelInfo.civitai_model_id || ""} (Version #${modelInfo.civitai_version_id})`}
+                >
+                  Civitai #{modelInfo.civitai_version_id} ↗
+                </a>
+              )}
+            </div>
+            {modelInfo?.installed === false && (
+              <ModelInstaller
+                modelInfo={modelInfo}
+                onInstalled={refreshModels}
+              />
+            )}
+            {Object.entries(PRESETS).map(([key, p]) => (
+              <button
+                key={key}
+                type="button"
+                className={`preset-btn${activePreset === key ? " active" : ""}`}
+                onClick={() => {
+                  setWidth(p.width);
+                  setHeight(p.height);
+                  setSteps(p.steps);
+                  if (p.guidance !== undefined) setGuidance(p.guidance);
+                  if (p.sampler !== undefined) setSampler(p.sampler);
+                  setCacheInterval(p.cache_interval ?? 1);
+                  if (model === "krea2-turbo") {
+                    setLoras(kreaDistillUpdater(p.steps, loraRegistry));
+                  }
+                }}
+                title={`${p.width}×${p.height}, ${p.steps} steps${p.sampler ? `, ${p.sampler}` : ""}`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <GenerationParams
+            modelInfo={modelInfo}
+            width={width}
+            setWidth={setWidth}
+            height={height}
+            setHeight={setHeight}
+            steps={steps}
+            setSteps={setSteps}
+            guidance={guidance}
+            setGuidance={setGuidance}
+            seed={seed}
+            setSeed={setSeed}
+            batch={batch}
+            setBatch={setBatch}
+            negativePrompt={negativePrompt}
+            setNegativePrompt={setNegativePrompt}
+            sampler={sampler}
+            setSampler={setSampler}
+            cacheInterval={cacheInterval}
+            setCacheInterval={setCacheInterval}
+            supportsRef={supportsRef}
+            supportsMultiRef={supportsMultiRef}
+            refImages={refImages}
+            refStrength={refStrength}
+            setRefStrength={setRefStrength}
+            pickRefImages={pickRefImages}
+            removeRefImage={removeRefImage}
+            insertIntoPrompt={insertIntoPrompt}
+          />
+      {modelInfo.lora_format ? (
+        <LoraManagerDrawer
+          loras={loras}
+          setLoras={setLoras}
+          loraRegistry={loraRegistry}
+          setLoraRegistry={setLoraRegistry}
+          modelInfo={modelInfo}
+          engineBase={engineBase}
+          compatibleLoras={compatibleLoras}
+          onSwitchToLoraModel={switchToLoraModel}
+          onFeedback={(fb) => {
+            if (fb?.type === "error") setError(fb.text);
+          }}
+        >
+          <details className="lora-add">
+            <summary>＋ Import or Register new LoRA</summary>
+            <UniversalDownloader
+              engineBase={engineBase}
+              onLoraDownloaded={async () => {
+                const updated = await api("/api/loras");
+                setLoraRegistry(updated);
+              }}
+              onSwitchModel={(base) => switchToLoraModel(base)}
+            />
+            <div className="lora-divider"><span>or register local file</span></div>
+            <div className="lora-add-row">
+              <input
+                placeholder="name"
+                value={newLora.name}
+                onChange={(e) => setNewLora({ ...newLora, name: e.target.value })}
+              />
+              <input
+                placeholder="HF repo id or /local/path.safetensors"
+                value={newLora.path}
+                onChange={(e) => setNewLora({ ...newLora, path: e.target.value })}
+              />
+              <button type="button" onClick={saveNewLora} disabled={savingLora}>
+                {savingLora ? "Saving..." : "Save"}
+              </button>
+            </div>
+            <div className="lora-add-row">
+              <label className="file-label">
+                …or upload a local .safetensors file
+                <input
+                  type="file"
+                  accept=".safetensors"
+                  onChange={(e) => uploadLoraFile(e.target.files[0])}
+                  disabled={savingLora}
+                />
+              </label>
+            </div>
+            {uploadProgress && <p className="hint">{uploadProgress}</p>}
+            <p className="hint">Must be a {modelInfo.lora_format}-compatible LoRA (.safetensors).</p>
+          </details>
+        </LoraManagerDrawer>
+      ) : (
+        <p className="hint">LoRAs unavailable on {modelInfo.label}.</p>
+      )}
+
+      <div className="generate-btn-row">
+        <button
+          type="submit"
+          className="generate-btn"
+          disabled={busy && !dirty ? true : modelInfo?.installed === false}
+          title={
+            modelInfo?.installed === false
+              ? "Download this model first"
+              : undefined
+          }
+        >
+          {busy
+            ? dirty
+              ? "⚡ Queue with new parameters…"
+              : status === "queued"
+                ? "⏳ Queued (waiting for engine)…"
+                : jobPhase === "downloading"
+                  ? "📥 Downloading Model…"
+                  : jobPhase === "loading_model"
+                    ? "🧠 Loading into Memory…"
+                    : jobPhase === "compiling"
+                      ? "⚡ Compiling Shaders…"
+                      : jobPhase === "saving"
+                        ? "🎨 Finalizing Image…"
+                        : progress && progress.steps > 0
+                          ? `⚙ Step ${progress.step}/${progress.steps}…`
+                          : "⚙ Generating…"
+            : "Generate"}
+        </button>
+        {busy && (
+          <button
+            type="button"
+            className="cancel-action-btn"
+            title="Cancel this generation"
+            onClick={async () => {
+              await cancelJob();
+            }}
+          >
+            ✕ Cancel
+          </button>
+        )}
+      </div>
+      {busy && progress && progress.steps > 0 && (
+        <div className="progress-box">
+          <p className="hint">
+            {progress.batch > 1 && <>Image {progress.saved_index ?? Math.floor(progress.step / progress.steps) + 1}/{progress.batch} saved ✓ · </>}
+            Step {progress.step}/{progress.steps} · elapsed{" "}
+            {fmt(progress.elapsed)}
+            {progress.eta_seconds != null && (
+              <> · ETA ~{fmt(progress.eta_seconds)}</>
+            )}
+          </p>
+        </div>
+      )}
+      {busy && !progress && (
+        <p className="hint">
+          {jobPhaseDetail ||
+            (jobPhase === "downloading"
+              ? "Downloading model weights from repository…"
+              : jobPhase === "loading_model"
+                ? "Loading model weights into Apple Silicon unified memory (100% local, no internet)…"
+                : jobPhase === "compiling"
+                  ? "Compiling Metal shaders & encoding prompt…"
+                  : "Preparing generation…")}
+        </p>
+      )}
+      <GenerationStack />
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+
+      {showSwitchDialog && (
+        <div className="modal" onClick={() => setShowSwitchDialog(false)}>
+          <div
+            className="modal-body switch-dialog"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>Generation in progress with different settings</h3>
+            <p>
+              You modified the prompt or parameters. Queue this new generation
+              after the current one, or stop the current one and start now?
+            </p>
+            <div className="detail-actions">
+              <button onClick={queueNext}>Queue after current</button>
+              <button onClick={stopAndSwitch}>Stop current &amp; switch</button>
+              <button onClick={() => setShowSwitchDialog(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showEnhanceWarning && (
+        <div className="modal" onClick={() => setShowEnhanceWarning(false)}>
+          <div
+            className="modal-body switch-dialog"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>{engineLoading ? "Model is loading" : "Generation in progress"}</h3>
+            <p>
+              {engineLoading
+                ? "The engine is still loading into unified memory."
+                : "An image is currently being generated."}{" "}
+              The prompt enhancer runs a second local model on the same Apple Silicon
+              GPU and unified memory, so enhancing now can slow the current job and take
+              longer itself. You can cancel the enhancement at any time.
+            </p>
+            <div className="detail-actions">
+              <button
+                onClick={() => {
+                  setShowEnhanceWarning(false);
+                  runEnhancePrompt();
+                }}
+              >
+                Enhance anyway
+              </button>
+              <button onClick={() => setShowEnhanceWarning(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+        </form>
+      </div>
+
+      <div className="studio-canvas-pane">
+        <ResultCanvas
+          currentImage={currentResult}
+          onSetCurrentImage={setCurrentResult}
+          busy={busy}
+          progress={progress}
+          phase={jobPhase}
+          phaseDetail={jobPhaseDetail}
+          batchImages={batchResults}
+          generatingPrompt={busy ? (generatingPrompt || prompt) : null}
+          onSetReferenceImage={(ref) => {
+            addRefImage({
+              id: crypto.randomUUID(),
+              path: ref.path,
+              preview: ref.preview,
+              name: ref.path.split("/").pop(),
+            });
+          }}
+          onVariation={handleVariation}
+        />
+      </div>
+    </div>
+  );
+}

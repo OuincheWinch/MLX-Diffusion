@@ -1,0 +1,62 @@
+# -*- mode: gitignore; encoding: utf-8 -*-
+
+# ---- Secrets & local credentials (NEVER commit) ----
+backend/data/civitai_token.txt
+backend/data/hf_token.txt
+backend/data/*.token
+backend/data/*token*.txt
+**/hf_token.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+venv-coreml/
+venv-sdxl/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Node / frontend ----
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ---- Generated content & runtime state ----
+backend/data/generated/
+backend/data/uploads/
+backend/data/lora_files/
+backend/data/models/
+backend/data/SDXL/
+backend/data/loras.json
+backend/data/settings.json
+backend/data/pending_queue.json
+backend/data/queue_recovery.json
+backend/data/tmp*.download
+backend/data/.tmp/
+backend/data/settings.smoketest.json
+*.raw.png
+*.download
+
+# ---- Generated content, benchmarks & marketing outputs (kept local) ----
+backend/data/benchmarks/
+test/
+comparison_12_vs_4_steps/
+wordpress_export/
+.cache/
+data/tmp/
+
+# ---- Local agent state ----
+.opencode/
+
+# ---- OS / editor ----
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ---- Logs ----
+*.log
+nohup.out

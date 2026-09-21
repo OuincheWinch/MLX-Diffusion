@@ -1,0 +1,572 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, imageUrl } from "../api";
+import { bindFullImageDrag, copyFullImageToClipboard, revealImageInFinder } from "../utils/dragDrop";
+import LazyGalleryImage from "./LazyGalleryImage";
+
+export default function Gallery({ refreshKey, onReuse, activeTab = "browser", newImage = null }) {
+  const [items, setItems] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [query, setQuery] = useState("");
+  const [tags, setTags] = useState("");
+  const [sort, setSort] = useState("newest");
+  const [model, setModel] = useState("");
+  const [models, setModels] = useState([]);
+  const [lora, setLora] = useState("");
+  const [loraStats, setLoraStats] = useState({ total: 0, with_lora: 0, without_lora: 0, loras: [] });
+  const [page, setPage] = useState(1);
+  const [selected, setSelected] = useState(null);
+  const limit = 24;
+
+  const abortRef = useRef(null);
+
+  useEffect(() => {
+    api("/api/models").then(setModels).catch(() => {});
+  }, []);
+
+  // When a newly generated image arrives, prepend it immediately to items and reset to page 1
+  useEffect(() => {
+    if (!newImage || !newImage.id) return;
+    setItems((prev) => {
+      if (prev.some((it) => it.id === newImage.id)) return prev;
+      return [newImage, ...prev];
+    });
+    setTotal((t) => t + 1);
+    setPage(1);
+  }, [newImage]);
+
+  useEffect(() => {
+    if (activeTab !== "browser") return;
+    let alive = true;
+    api(`/api/gallery/loras${model ? `?model=${encodeURIComponent(model)}` : ""}`)
+      .then((stats) => {
+        if (alive && stats) setLoraStats(stats);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [model, refreshKey, activeTab]);
+
+  const labelFor = (repo) =>
+    models.find((m) => m.repo === repo)?.label ??
+    (repo?.includes("z-image") ? "Z-Image Turbo" : repo || "FLUX.2-klein 4B");
+
+  const load = useCallback(async () => {
+    const controller = new AbortController();
+    abortRef.current?.abort();
+    abortRef.current = controller;
+    try {
+      const params = new URLSearchParams({
+        query: query.trim(),
+        tags,
+        sort,
+        page,
+        limit,
+        model,
+        lora,
+      });
+      const data = await api(`/api/gallery?${params}`, {
+        signal: controller.signal,
+      });
+      setItems(data.items);
+      setTotal(data.total);
+    } catch (e) {
+      if (e.name !== "AbortError") {
+        /* keep previous items on transient failures */
+      }
+    }
+  }, [query, tags, sort, page, model, lora]);
+
+  // Load immediately on tab switch, refreshKey or filter changes
+  useEffect(() => {
+    if (activeTab !== "browser") return;
+    load();
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, [load, refreshKey, activeTab]);
+
+  async function openDetail(item) {
+    setSelected(item);
+    api(`/api/images/${item.id}`).then(setSelected).catch(() => {});
+  }
+
+  const selectedIndex = selected
+    ? items.findIndex((it) => it.id === selected.id)
+    : -1;
+
+  const navigateDetail = useCallback(
+    (delta) => {
+      if (selectedIndex < 0) return;
+      const next = items[selectedIndex + delta];
+      if (!next) return;
+      setSelected(next);
+      api(`/api/images/${next.id}`).then(setSelected).catch(() => {});
+    },
+    [selectedIndex, items]
+  );
+
+  useEffect(() => {
+    if (!selected) return;
+    function onKey(e) {
+      if (["INPUT", "TEXTAREA"].includes(e.target?.tagName)) return;
+      if (e.key === "ArrowLeft") navigateDetail(-1);
+      else if (e.key === "ArrowRight") navigateDetail(1);
+      else if (e.key === "Escape") setSelected(null);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected, navigateDetail]);
+
+  async function deleteImage(id) {
+    await api(`/api/images/${id}`, { method: "DELETE" });
+    setSelected(null);
+    load();
+  }
+
+  async function saveTags(id, tagString) {
+    const updated = await api(`/api/images/${id}/tags`, {
+      method: "POST",
+      body: JSON.stringify({
+        tags: tagString.split(",").map((t) => t.trim()).filter(Boolean),
+      }),
+    });
+    setSelected(updated);
+    load();
+  }
+
+  const pages = Math.max(1, Math.ceil(total / limit));
+
+  const [copied, setCopied] = useState(false);
+  const [promptCopied, setPromptCopied] = useState(false);
+  const [imageCopied, setImageCopied] = useState(false);
+  const [revealed, setRevealed] = useState(false);
+  const [cardCopiedId, setCardCopiedId] = useState(null);
+  const [upscaling, setUpscaling] = useState(false);
+
+  const copyImage = useCallback(async (img = selected) => {
+    if (!img?.id) return;
+    try {
+      await copyFullImageToClipboard(img);
+      if (img.id === selected?.id) {
+        setImageCopied(true);
+        setTimeout(() => setImageCopied(false), 2500);
+      }
+      setCardCopiedId(img.id);
+      setTimeout(() => setCardCopiedId(null), 2000);
+    } catch {
+      window.open(imageUrl(img.id), "_blank");
+    }
+  }, [selected]);
+
+  const handleReveal = useCallback(async (img = selected) => {
+    if (!img?.id) return;
+    const ok = await revealImageInFinder(img);
+    if (ok) {
+      setRevealed(true);
+      setTimeout(() => setRevealed(false), 2500);
+    }
+  }, [selected]);
+
+  useEffect(() => {
+    if (!selected) return;
+    const handleKeyDown = (e) => {
+      if (["INPUT", "TEXTAREA"].includes(e.target?.tagName)) return;
+      if ((e.metaKey || e.ctrlKey) && e.key === "c") {
+        e.preventDefault();
+        copyImage(selected);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selected, copyImage]);
+
+  async function copySeed() {
+    try {
+      await navigator.clipboard.writeText(String(selected.seed));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  }
+
+  async function copyPrompt() {
+    try {
+      await navigator.clipboard.writeText(selected.prompt || "");
+      setPromptCopied(true);
+      setTimeout(() => setPromptCopied(false), 1500);
+    } catch {}
+  }
+
+
+  async function handleUpscale(scale = 2) {
+    setUpscaling(true);
+    try {
+      const upscaled = await api(`/api/images/${selected.id}/upscale`, {
+        method: "POST",
+        body: JSON.stringify({ scale }),
+      });
+      setSelected(upscaled);
+      load();
+    } catch (e) {
+      alert(`Upscale error: ${e.message || e}`);
+    } finally {
+      setUpscaling(false);
+    }
+  }
+
+  return (
+    <div className="gallery">
+      <div className="gallery-controls">
+        <input
+          className="search"
+          placeholder="Search prompts or seeds..."
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setPage(1);
+          }}
+        />
+        <input
+          placeholder="tags: comma,separated"
+          value={tags}
+          onChange={(e) => {
+            setTags(e.target.value);
+            setPage(1);
+          }}
+        />
+        <select value={sort} onChange={(e) => setSort(e.target.value)}>
+          <option value="newest">Newest</option>
+          <option value="oldest">Oldest</option>
+        </select>
+        <select
+          className="model-filter"
+          value={model}
+          onChange={(e) => {
+            setModel(e.target.value);
+            setPage(1);
+          }}
+        >
+          <option value="">All models</option>
+          {models.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+        <select
+          className="lora-filter"
+          value={lora}
+          onChange={(e) => {
+            setLora(e.target.value);
+            setPage(1);
+          }}
+          title="Filter images by LoRA"
+        >
+          <option value="">All Images ({loraStats?.total ?? total})</option>
+          <option value="__none__">Without LoRA ({loraStats?.without_lora ?? 0})</option>
+          <option value="__any__">With any LoRA ({loraStats?.with_lora ?? 0})</option>
+          {loraStats?.loras?.length > 0 && (
+            <optgroup label="Installed & Used LoRAs">
+              {loraStats.loras.map((l) => (
+                <option key={l.name} value={l.name}>
+                  {l.name} ({l.count})
+                </option>
+              ))}
+            </optgroup>
+          )}
+        </select>
+        <span className="count">
+          {total} image{total === 1 ? "" : "s"}
+        </span>
+      </div>
+
+      <div className="gallery-lora-tabs-bar">
+        <div className="gallery-lora-tabs-header">
+          <span className="lora-tabs-title">LoRA:</span>
+          {lora && (
+            <button
+              type="button"
+              className="lora-clear-btn"
+              onClick={() => {
+                setLora("");
+                setPage(1);
+              }}
+              title="Reset LoRA filter"
+            >
+              ✕ Clear filter
+            </button>
+          )}
+        </div>
+        <div className="gallery-lora-tabs">
+          <button
+            type="button"
+            className={`lora-tab-btn ${lora === "" ? "active" : ""}`}
+            onClick={() => {
+              setLora("");
+              setPage(1);
+            }}
+          >
+            All Images <span className="lora-tab-count">{loraStats?.total ?? total}</span>
+          </button>
+          <button
+            type="button"
+            className={`lora-tab-btn ${lora === "__none__" ? "active" : ""}`}
+            onClick={() => {
+              setLora(lora === "__none__" ? "" : "__none__");
+              setPage(1);
+            }}
+          >
+            Without LoRA <span className="lora-tab-count">{loraStats?.without_lora ?? 0}</span>
+          </button>
+          <button
+            type="button"
+            className={`lora-tab-btn ${lora === "__any__" ? "active" : ""}`}
+            onClick={() => {
+              setLora(lora === "__any__" ? "" : "__any__");
+              setPage(1);
+            }}
+          >
+            With any LoRA <span className="lora-tab-count">{loraStats?.with_lora ?? 0}</span>
+          </button>
+          {loraStats?.loras?.map((l) => (
+            <button
+              key={l.name}
+              type="button"
+              className={`lora-tab-btn ${lora === l.name ? "active" : ""}`}
+              onClick={() => {
+                setLora(lora === l.name ? "" : l.name);
+                setPage(1);
+              }}
+              title={`Filter by ${l.name} (${l.count} image${l.count === 1 ? "" : "s"})`}
+            >
+              <span className="lora-tab-name">{l.name}</span>
+              <span className="lora-tab-count">{l.count}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {items.length === 0 ? (
+        <p className="hint">No images yet. Generate something!</p>
+      ) : (
+        <div className="grid">
+          {items.map((item) => (
+            <div
+              key={item.id}
+              role="button"
+              tabIndex={0}
+              className="cell"
+              onClick={() => openDetail(item)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  openDetail(item);
+                }
+              }}
+              title="Click to view details · Drag anywhere for full-resolution image"
+              {...bindFullImageDrag(item)}
+            >
+              <LazyGalleryImage item={item} />
+              <div className="cell-quick-actions" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  className="cell-quick-btn"
+                  title="Copier l'image PNG (Cmd+V sur Civitai ou dans le chat)"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    copyImage(item);
+                  }}
+                >
+                  {cardCopiedId === item.id ? "✓" : "📋"}
+                </button>
+                <button
+                  type="button"
+                  className="cell-quick-btn"
+                  title="Révéler le fichier dans le Finder macOS"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleReveal(item);
+                  }}
+                >
+                  📂
+                </button>
+              </div>
+              <span className="cell-model-badge">{labelFor(item.model)}</span>
+              <div className="cell-caption">{item.prompt}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {pages > 1 && (
+        <div className="pagination">
+          <button disabled={page <= 1} onClick={() => setPage(page - 1)}>
+            ←
+          </button>
+          <span>
+            {page} / {pages}
+          </span>
+          <button disabled={page >= pages} onClick={() => setPage(page + 1)}>
+            →
+          </button>
+        </div>
+      )}
+
+      {selected && (
+        <div className="modal" onClick={() => setSelected(null)}>
+          {selectedIndex > 0 && (
+            <button
+              className="nav-arrow nav-prev"
+              onClick={(e) => {
+                e.stopPropagation();
+                navigateDetail(-1);
+              }}
+              title="Previous (←)"
+            >
+              ←
+            </button>
+          )}
+          {selectedIndex >= 0 && selectedIndex < items.length - 1 && (
+            <button
+              className="nav-arrow nav-next"
+              onClick={(e) => {
+                e.stopPropagation();
+                navigateDetail(1);
+              }}
+              title="Next (→)"
+            >
+              →
+            </button>
+          )}
+          <div className="modal-body" onClick={(e) => e.stopPropagation()}>
+            <img
+              src={imageUrl(selected.id)}
+              alt={selected.prompt}
+              title="Drag for full-resolution image"
+              {...bindFullImageDrag(selected)}
+            />
+            <div className="detail">
+              <p className="detail-prompt">{selected.prompt}</p>
+              <dl>
+                <dt>Model</dt>
+                <dd>{labelFor(selected.model)}</dd>
+                <dt>Seed</dt>
+                <dd>{selected.seed}</dd>
+                <dt>Size</dt>
+                <dd>
+                  {selected.width} × {selected.height}
+                </dd>
+                <dt>Steps</dt>
+                <dd>{selected.steps}</dd>
+                <dt>Guidance</dt>
+                <dd>{selected.guidance}</dd>
+                {selected.sampler && (
+                  <>
+                    <dt>Sampler</dt>
+                    <dd>{selected.sampler}</dd>
+                  </>
+                )}
+                {selected.negative_prompt && (
+                  <>
+                    <dt>Negative</dt>
+                    <dd>{selected.negative_prompt}</dd>
+                  </>
+                )}
+                {selected.quantization != null && (
+                  <>
+                    <dt>Quantization</dt>
+                    <dd>{selected.quantization}-bit</dd>
+                  </>
+                )}
+                <dt>Time</dt>
+                <dd>{selected.generation_time}s</dd>
+                {selected.loras?.length > 0 && (
+                  <>
+                    <dt>LoRAs</dt>
+                    <dd>
+                      {selected.loras
+                        .map((l) => {
+                          const name = l.name || (l.path ? l.path.split("/").pop() : String(l));
+                          return l.scale !== undefined ? `${name} (${l.scale})` : name;
+                        })
+                        .join(", ")}
+                    </dd>
+                  </>
+                )}
+              </dl>
+              <TagEditor key={selected.id} item={selected} onSave={(t) => saveTags(selected.id, t)} />
+              <div className="detail-actions">
+                <button
+                  className="btn-accent"
+                  onClick={() => copyImage(selected)}
+                  title="Copier l'image PNG originale dans le presse-papier macOS (Cmd+C / puis Cmd+V sur Civitai ou dans le chat)"
+                >
+                  {imageCopied ? "Image Copiée ✓ (Cmd+V)" : "📋 Copier l'image"}
+                </button>
+                <button
+                  onClick={() => handleReveal(selected)}
+                  title="Ouvrir l'image originale dans le Finder macOS pour la glisser-déposer vers Civitai"
+                >
+                  {revealed ? "Ouvert dans le Finder ✓" : "📂 Finder"}
+                </button>
+                <button onClick={copyPrompt}>
+                  {promptCopied ? "Prompt copied ✓" : "Copy prompt"}
+                </button>
+                <button onClick={copySeed}>
+                  {copied ? "Copied ✓" : "Copy seed"}
+                </button>
+                <button
+                  onClick={() => handleUpscale(2)}
+                  disabled={upscaling}
+                  title="2x Super-Resolution Upscale"
+                >
+                  {upscaling ? "Upscaling…" : "⚡ Upscale 2x"}
+                </button>
+                <button
+                  onClick={() => handleUpscale(4)}
+                  disabled={upscaling}
+                  title="4x Super-Resolution Upscale"
+                >
+                  {upscaling ? "Upscaling…" : "⚡ Upscale 4x"}
+                </button>
+                <button
+                  onClick={() => {
+                    onReuse(selected);
+                    setSelected(null);
+                  }}
+                >
+                  Reuse params
+                </button>
+                <a className="btn" href={imageUrl(selected.id)} download={selected.file || `${selected.id}.${selected.format || 'png'}`}>
+                  Download
+                </a>
+                <button
+                  className="danger"
+                  onClick={() =>
+                    confirm("Delete this image?") && deleteImage(selected.id)
+                  }
+                >
+                  Delete
+                </button>
+                <button onClick={() => setSelected(null)}>Close</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TagEditor({ item, onSave }) {
+  const [value, setValue] = useState((item.tags || []).join(", "));
+  return (
+    <div className="tag-editor">
+      <label>
+        Tags
+        <input value={value} onChange={(e) => setValue(e.target.value)} />
+      </label>
+      <button onClick={() => onSave(value)}>Save tags</button>
+    </div>
+  );
+}
