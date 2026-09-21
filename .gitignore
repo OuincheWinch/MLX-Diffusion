@@ -51,6 +51,19 @@ data/tmp/
 # ---- Local agent state ----
 .opencode/
 
+# ---- Local-only work & hidden tests (never committed) ----
+tasks/
+backend/tests/
+
+# ---- Personal docs (kept local only) ----
+AGENTS.md
+ARCHITECTURE.md
+ARCHITECTURE_FR.md
+ELON.md
+Principles.md
+QWENROUTE.md
+coding.md
+
 # ---- OS / editor ----
 .DS_Store
 *.swp
