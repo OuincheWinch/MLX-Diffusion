@@ -83,41 +83,39 @@ Measured on the **2021 MacBook Pro M1 (16 GB)**, from the last 2 days of studio 
 
 ## Model vs model — visual arena
 
-Head-to-head repeatability images (prompt: stormtrooper in a swiss alpine valley · seed **1337** · same prompt per pair). Each duel plays *live right here in the README* as a muted auto-wiping divider video — the same sweep the interactive arena does, no scripts needed (GitHub strips JavaScript from READMEs, so a draggable slider can't render on the repo page; the moving divider below is the closest that does). For the **draggable** version, open [`docs/model-arena/index.html`](docs/model-arena/index.html) in a browser.
+Head-to-head repeatability comparisons from the 11-prompt benchmarking suite (original, royalty-free scenes — a sourdough loaf, a cliff villa, a snow leopard; **no copyrighted characters**). Each duel plays *live right here in the README* as a muted auto-wiping divider video — the same sweep the interactive arena does, no scripts needed (GitHub strips JavaScript from READMEs, so a draggable slider can't render on the repo page; the moving divider below is the closest that does). For the **draggable** version, open [`docs/model-arena/index.html`](docs/model-arena/index.html) in a browser.
 
-### 768 × 768 — FLUX.2-klein 4B vs Z-Image Turbo 6B (4 vs 8 steps)
+### FLUX.2-klein 4B vs Z-Image Turbo 6B — "Rustic Sourdough" (512×768)
 
-<video muted loop autoplay playsinline controls poster="docs/model-arena/images/flux2_klein_768.png">
+<video muted loop autoplay playsinline controls poster="docs/model-arena/images/flux2_klein_sourdough.png">
   <source src="docs/model-arena/images/arena_flux2_vs_zimage.mp4" type="video/mp4">
 </video>
 
-| FLUX.2-klein 4B (median 1:16) | Z-Image Turbo 6B (median 2:54) |
+| FLUX.2-klein 4B | Z-Image Turbo 6B |
 |---|---|
-| ![FLUX.2-klein 4B, 768x768, seed 1337](docs/model-arena/images/flux2_klein_768.png) | ![Z-Image Turbo 6B, 768x768, seed 1337](docs/model-arena/images/z_image_768.png) |
+| ![FLUX.2-klein 4B, Rustic Sourdough](docs/model-arena/images/flux2_klein_sourdough.png) | ![Z-Image Turbo 6B, Rustic Sourdough](docs/model-arena/images/zimage_sourdough.png) |
 
-### 1024 × 1024 — FLUX.2-klein 4B vs Juggernaut XL Lightning
+### FLUX.2-klein 4B vs Juggernaut XL Lightning — "Modern Glass Villa" (512×768)
 
-<video muted loop autoplay playsinline controls poster="docs/model-arena/images/flux2_klein_1024.png">
+<video muted loop autoplay playsinline controls poster="docs/model-arena/images/flux2_klein_villa.png">
   <source src="docs/model-arena/images/arena_flux2_vs_juggernaut.mp4" type="video/mp4">
 </video>
 
-| FLUX.2-klein 4B (median 2:03) | Juggernaut XL Lightning (median 1:07) |
+| FLUX.2-klein 4B | Juggernaut XL Lightning |
 |---|---|
-| ![FLUX.2-klein 4B, 1024x1024, seed 1337](docs/model-arena/images/flux2_klein_1024.png) | ![Juggernaut XL Lightning, 1024x1024, seed 1337](docs/model-arena/images/juggernaut_1024.png) |
+| ![FLUX.2-klein 4B, Modern Glass Villa](docs/model-arena/images/flux2_klein_villa.png) | ![Juggernaut XL Lightning, Modern Glass Villa](docs/model-arena/images/juggernaut_villa.png) |
 
-### 1024 × 1024 — FLUX.2-klein 4B vs Krea 2 Turbo 13B
+### FLUX.2-klein 4B vs Krea 2 Turbo 13B — "Snow Leopard" (512×768)
 
-<video muted loop autoplay playsinline controls poster="docs/model-arena/images/flux2_klein_1024.png">
+<video muted loop autoplay playsinline controls poster="docs/model-arena/images/flux2_klein_leopard.png">
   <source src="docs/model-arena/images/arena_flux2_vs_krea.mp4" type="video/mp4">
 </video>
 
-| FLUX.2-klein 4B (median 2:03) | Krea 2 Turbo 13B (median 12:16*) |
+| FLUX.2-klein 4B | Krea 2 Turbo 13B |
 |---|---|
-| ![FLUX.2-klein 4B, 1024x1024, seed 1337](docs/model-arena/images/flux2_klein_1024.png) | ![Krea 2 Turbo 13B, 1024x1024, seed 1337](docs/model-arena/images/krea2_1024.png) |
+| ![FLUX.2-klein 4B, Snow Leopard](docs/model-arena/images/flux2_klein_leopard.png) | ![Krea 2 Turbo 13B, Snow Leopard](docs/model-arena/images/krea_leopard.png) |
 
-\* Krea 2 Turbo at 1024×1024 ran under elevated system load; its realistic sweet spot is 512×768 (2:51 median) or 512×512 (2:44).
-
-> Wipe doesn't play? Some mail/clients block autoplay — hit the ▶ control, or use the static tables above. For the full interactive arena: open [`docs/model-arena/index.html`](docs/model-arena/index.html) in a browser.
+> Wipe doesn't play? Some clients block autoplay — hit the ▶ control, or use the static tables above. For the full interactive arena: open [`docs/model-arena/index.html`](docs/model-arena/index.html) in a browser.
 
 ---
 

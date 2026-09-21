@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MLX-DIFFUSION — Model Arena (repeatability tests)</title>
+<title>MLX-DIFFUSION — Model Arena</title>
 <style>
   :root {
     --bg: #07090c;
@@ -59,7 +59,7 @@
   .slider-stage {
     position: relative;
     width: 100%;
-    aspect-ratio: 1 / 1;
+    aspect-ratio: 512 / 768;
     background: #000;
     overflow: hidden;
     user-select: none;
@@ -90,7 +90,7 @@
     font-size: 0.72rem; font-weight: 800; border-radius: 5px; z-index: 4;
     pointer-events: none;
   }
-  .slider-tag.left  { left: 0.7rem; background: rgba(13,17,23,0.75); color: var(--accent);  border: 1px solid rgba(88,166,255,0.55); }
+  .slider-tag.left  { left: 0.7rem;  background: rgba(13,17,23,0.75); color: var(--accent);  border: 1px solid rgba(88,166,255,0.55); }
   .slider-tag.right { right: 0.7rem; background: rgba(13,17,23,0.75); color: var(--orange); border: 1px solid rgba(240,136,62,0.55); }
 
   /* Full-stage invisible range input drives the divider */
@@ -117,84 +117,80 @@
 <body>
 <div class="wrap">
   <h1>MLX-DIFFUSION — Model Arena</h1>
-  <div class="sub">Drag each divider to compare models head-to-head. Images from the repeatability suite (seed 1337, same prompt).</div>
+  <div class="sub">Drag each divider to compare models head-to-head. Images come from the repeatability benchmarking suite — original, royalty-free scenes (no copyrighted characters).</div>
 
   <div class="prompt-box">
-    Prompt: <b>"a detailed imperial stormtrooper standing in a scenic swiss alpine landscape,
-    green valley, snow-capped mountains, wooden chalet, cinematic lighting"</b> — seed <b>1337</b>
+    All duels use the same prompt per pair, generated identically for both models — e.g. <b>"a rustic, freshly baked sourdough loaf resting on a weathered oak cutting board, crust with intricate decorative scoring…"</b>
   </div>
 
   <div class="grid">
-    <!-- CARD 1: FLUX.2-klein 4B vs Z-Image Turbo @768 -->
+    <!-- CARD 1: FLUX.2-klein 4B vs Z-Image Turbo — Rustic Sourdough -->
     <div class="comp-card">
       <div class="comp-card-header">
-        <span>FLUX.2-klein 4B <span class="vs">vs</span> Z-Image Turbo 6B · 768×768</span>
-        <span class="comp-badge">4 vs 8 steps</span>
+        <span>FLUX.2-klein 4B <span class="vs">vs</span> Z-Image Turbo 6B</span>
+        <span class="comp-badge">Rustic Sourdough · 512×768</span>
       </div>
       <div class="slider-stage" id="stage1" style="--pos:50%">
-        <img class="slider-img bottom" src="images/z_image_768.png" alt="Z-Image Turbo 6B, 768x768, seed 1337">
-        <span class="slider-tag right">Z-Image Turbo 6B · 8 steps</span>
-        <img class="slider-img top" src="images/flux2_klein_768.png" alt="FLUX.2-klein 4B, 768x768, seed 1337">
-        <span class="slider-tag left">FLUX.2-klein 4B · 4 steps</span>
+        <img class="slider-img bottom" src="images/zimage_sourdough.png" alt="Z-Image Turbo 6B, Rustic Sourdough">
+        <span class="slider-tag right">Z-Image Turbo 6B</span>
+        <img class="slider-img top" src="images/flux2_klein_sourdough.png" alt="FLUX.2-klein 4B, Rustic Sourdough">
+        <span class="slider-tag left">FLUX.2-klein 4B</span>
         <div class="slider-divider"></div>
         <div class="slider-handle">◄ ►</div>
         <input type="range" min="0" max="100" value="50" class="range-input" data-stage="stage1">
       </div>
       <div class="comp-card-footer">
-        <span>Median gen time: <b>1:16 vs 2:54</b></span>
-        <span>Diff: <b>it's the character/lighting trade-off</b></span>
+        <span>FLUX.2-klein 4B — left of divider</span>
+        <span>Z-Image Turbo 6B — right of divider</span>
       </div>
     </div>
 
-    <!-- CARD 2: FLUX.2-klein 4B vs Juggernaut XL Lightning @1024 -->
+    <!-- CARD 2: FLUX.2-klein 4B vs Juggernaut XL Lightning — Modern Glass Villa -->
     <div class="comp-card">
       <div class="comp-card-header">
-        <span>FLUX.2-klein 4B <span class="vs">vs</span> Juggernaut XL Lightning · 1024×1024</span>
-        <span class="comp-badge">4 vs 4 steps</span>
+        <span>FLUX.2-klein 4B <span class="vs">vs</span> Juggernaut XL Lightning</span>
+        <span class="comp-badge">Glass Villa · 512×768</span>
       </div>
       <div class="slider-stage" id="stage2" style="--pos:50%">
-        <img class="slider-img bottom" src="images/juggernaut_1024.png" alt="Juggernaut XL Lightning, 1024x1024, seed 1337">
-        <span class="slider-tag right">Juggernaut XL Lightning (SDXL) · 4 steps</span>
-        <img class="slider-img top" src="images/flux2_klein_1024.png" alt="FLUX.2-klein 4B, 1024x1024, seed 1337">
-        <span class="slider-tag left">FLUX.2-klein 4B · 4 steps</span>
+        <img class="slider-img bottom" src="images/juggernaut_villa.png" alt="Juggernaut XL Lightning, Modern Glass Villa">
+        <span class="slider-tag right">Juggernaut XL Lightning</span>
+        <img class="slider-img top" src="images/flux2_klein_villa.png" alt="FLUX.2-klein 4B, Modern Glass Villa">
+        <span class="slider-tag left">FLUX.2-klein 4B</span>
         <div class="slider-divider"></div>
         <div class="slider-handle">◄ ►</div>
         <input type="range" min="0" max="100" value="50" class="range-input" data-stage="stage2">
       </div>
       <div class="comp-card-footer">
-        <span>Median gen time: <b>2:03 vs 1:07</b></span>
-        <span>Fastest combo: <b>Juggernaut 512×768 = 9 s</b></span>
+        <span>FLUX.2-klein 4B — left of divider</span>
+        <span>Juggernaut XL Lightning — right of divider</span>
       </div>
     </div>
 
-    <!-- CARD 3: FLUX.2-klein 4B vs Krea 2 Turbo @1024 -->
+    <!-- CARD 3: FLUX.2-klein 4B vs Krea 2 Turbo 13B — Snow Leopard -->
     <div class="comp-card">
       <div class="comp-card-header">
-        <span>FLUX.2-klein 4B <span class="vs">vs</span> Krea 2 Turbo 13B · 1024×1024</span>
-        <span class="comp-badge">4 vs 8 steps</span>
+        <span>FLUX.2-klein 4B <span class="vs">vs</span> Krea 2 Turbo 13B</span>
+        <span class="comp-badge">Snow Leopard · 512×768</span>
       </div>
       <div class="slider-stage" id="stage3" style="--pos:50%">
-        <img class="slider-img bottom" src="images/krea2_1024.png" alt="Krea 2 Turbo 13B, 1024x1024, seed 1337">
-        <span class="slider-tag right">Krea 2 Turbo 13B · 8 steps</span>
-        <img class="slider-img top" src="images/flux2_klein_1024.png" alt="FLUX.2-klein 4B, 1024x1024, seed 1337">
-        <span class="slider-tag left">FLUX.2-klein 4B · 4 steps</span>
+        <img class="slider-img bottom" src="images/krea_leopard.png" alt="Krea 2 Turbo 13B, Snow Leopard">
+        <span class="slider-tag right">Krea 2 Turbo 13B</span>
+        <img class="slider-img top" src="images/flux2_klein_leopard.png" alt="FLUX.2-klein 4B, Snow Leopard">
+        <span class="slider-tag left">FLUX.2-klein 4B</span>
         <div class="slider-divider"></div>
         <div class="slider-handle">◄ ►</div>
         <input type="range" min="0" max="100" value="50" class="range-input" data-stage="stage3">
       </div>
       <div class="comp-card-footer">
-        <span>Median gen time: <b>2:03 vs 12:16<span style="color:#f0883e">*</span></b></span>
-        <span>Krea sweet spot: <b>512×768 · 2:51</b></span>
+        <span>FLUX.2-klein 4B — left of divider</span>
+        <span>Krea 2 Turbo 13B — right of divider</span>
       </div>
     </div>
   </div>
 
   <div class="note">
-    * Krea 2 Turbo 1024×1024 profiling run happened under elevated system load (~9);
-    its realistic sweet spot is 512×768 (2:51 median) or 512×512 (2:44).
-    Any slider sticking? Open this file in a browser — dragging the divider relies on
-    the <code>&lt;input type="range"&gt;</code> overlay setting a CSS variable; image
-    pairings are static files in <code>images/</code>.
+    Drag the divider in any browser — the invisible <code>&lt;input type="range"&gt;</code> overlay sets a CSS variable that clips the top image.
+    The same comparison plays inline in the README as muted looping videos (GitHub strips JavaScript, so the draggable version only works opened as a local file).
   </div>
 </div>
 
