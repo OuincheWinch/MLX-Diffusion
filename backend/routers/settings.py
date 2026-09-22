@@ -46,6 +46,29 @@ def engine_status():
     return generator.get_engine_status()
 
 
+class EngineConfigRequest(BaseModel):
+    memory_wired_limit_gb: float | None = None
+    memory_krea_wired_limit_gb: float | None = None
+    idle_kill_s_mflux: int | None = None
+    idle_kill_s_sdxl: int | None = None
+
+
+@router.post("/api/engine/config")
+def update_engine_config(req: EngineConfigRequest):
+    """Persist runtime engine tuning (wired limits, idle policies). Values are
+    applied lazily — on the next generation start / idle rearm — and never
+    interrupt a running generation or restart the daemon."""
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "nothing to update")
+    try:
+        app_settings.update_settings(updates)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    generator.rearm_engine_watchdogs()
+    return generator.get_engine_status()
+
+
 def _hf_cache_payload() -> dict:
     repos = []
     total = 0

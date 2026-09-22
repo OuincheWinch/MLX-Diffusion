@@ -322,8 +322,29 @@ except ValueError:
 _KREA_WIRED_LIMIT_GB *= (1 << 30)
 
 
+def _env_wired_gb() -> float:
+    return _WIRED_LIMIT_GB / (1 << 30) if _WIRED_LIMIT_GB > 0 else 0
+
+
+def _env_krea_gb() -> float:
+    return _KREA_WIRED_LIMIT_GB / (1 << 30) if _KREA_WIRED_LIMIT_GB > 0 else 0
+
+
+def _wired_limit_gb() -> float:
+    """Effective generic wired limit (GB): persisted setting > env var default."""
+    v = app_settings.get_setting("memory_wired_limit_gb")
+    return float(v) if v is not None else _env_wired_gb()
+
+
+def _krea_wired_limit_gb() -> float:
+    """Effective krea2 wired limit (GB): persisted setting > env var default."""
+    v = app_settings.get_setting("memory_krea_wired_limit_gb")
+    return float(v) if v is not None else _env_krea_gb()
+
+
 def _wired_limit_bytes() -> int:
-    if _WIRED_LIMIT_GB <= 0:
+    limit = _wired_limit_gb()
+    if limit <= 0:
         return 0
     try:
         import mlx.core as mx
@@ -338,19 +359,20 @@ def _wired_limit_bytes() -> int:
                 budget = int(mem * 0.45)
                 if cap > 0:
                     budget = min(budget, cap)
-                return min(_WIRED_LIMIT_GB, budget)
+                return min(int(limit * (1 << 30)), budget)
             if cap > 0:
-                return min(_WIRED_LIMIT_GB, int(cap * 0.45))
+                return min(int(limit * (1 << 30)), int(cap * 0.45))
     except Exception:
         pass
-    return min(_WIRED_LIMIT_GB, 7 * (1 << 30))
+    return min(int(limit * (1 << 30)), 7 * (1 << 30))
 
 
 def _krea_wired_limit_bytes() -> int:
     """Wired budget for krea2 (13B q4): 68% of unified memory (vs 45% generic)
     so the transformer + TAEF decode allocations fit without the historical
     starved-decode hang, while still bounded to reduce macOS swap thrash."""
-    if _KREA_WIRED_LIMIT_GB <= 0:
+    limit = _krea_wired_limit_gb()
+    if limit <= 0:
         return 0
     try:
         import mlx.core as mx
@@ -364,12 +386,12 @@ def _krea_wired_limit_bytes() -> int:
                 budget = int(mem * 0.68)
                 if cap > 0:
                     budget = min(budget, cap)
-                return min(_KREA_WIRED_LIMIT_GB, budget)
+                return min(int(limit * (1 << 30)), budget)
             if cap > 0:
-                return min(_KREA_WIRED_LIMIT_GB, int(cap * 0.68))
+                return min(int(limit * (1 << 30)), int(cap * 0.68))
     except Exception:
         pass
-    return min(_KREA_WIRED_LIMIT_GB, 9 * (1 << 30))
+    return min(int(limit * (1 << 30)), 9 * (1 << 30))
 
 _lock = threading.Lock()
 _cancel_event = threading.Event()
@@ -774,32 +796,34 @@ def get_engine_status() -> dict:
         pass
 
     status["wired"] = {
-        "generic_limit_gb": _WIRED_LIMIT_GB / (1 << 30) if _WIRED_LIMIT_GB > 0 else 0,
+        "generic_limit_gb": _wired_limit_gb(),
         "generic_budget_bytes": _wired_limit_bytes(),
-        "krea_limit_gb": _KREA_WIRED_LIMIT_GB / (1 << 30) if _KREA_WIRED_LIMIT_GB > 0 else 0,
+        "krea_limit_gb": _krea_wired_limit_gb(),
         "krea_budget_bytes": _krea_wired_limit_bytes(),
     }
 
     now = time.time()
+    mflux_idle = _mflux_idle_kill_s()
     status["mflux"] = {
         "resident": _pipeline is not None,
         "model": _current_pipeline_model,
-        "idle_kill_s": MFLUX_IDLE_KILL_S,
+        "idle_kill_s": mflux_idle,
         "watchdog_armed": _mflux_watchdog is not None and _mflux_watchdog.is_alive(),
         "idle_since": _mflux_idle_since,
         "seconds_until_release": (
-            max(0, MFLUX_IDLE_KILL_S - (now - _mflux_idle_since)) if _mflux_idle_since else None
+            max(0, mflux_idle - (now - _mflux_idle_since)) if _mflux_idle_since else None
         ),
         "prompt_cache_size": len(_prompt_cache),
     }
+    sdxl_idle = _sdxl_idle_kill_s()
     status["sdxl"] = {
         "resident": _sdxl_daemon is not None and _sdxl_daemon.poll() is None,
         "model": Path(_current_sdxl_model).name if _current_sdxl_model else None,
-        "idle_kill_s": SDXL_IDLE_KILL_S,
+        "idle_kill_s": sdxl_idle,
         "watchdog_armed": _sdxl_watchdog is not None and _sdxl_watchdog.is_alive(),
         "idle_since": _sdxl_idle_since,
         "seconds_until_release": (
-            max(0, SDXL_IDLE_KILL_S - (now - _sdxl_idle_since)) if _sdxl_idle_since else None
+            max(0, sdxl_idle - (now - _sdxl_idle_since)) if _sdxl_idle_since else None
         ),
         "stderr_tail": "".join(_sdxl_stderr_tail)[-1200:],
     }
@@ -1491,6 +1515,10 @@ def generate(
             "format": fmt,
             "fast_vae": bool(fast_vae),
         }
+        # Strength is meaningful only for strength-based single-ref conditioning
+        # (Z-Image / Krea2). FLUX.2 in-context edit ignores strength entirely.
+        if ref_paths and variant == "standard":
+            meta["reference_strength"] = round(float(image_strength if image_strength is not None else 0.6), 3)
         if minfo.get("civitai_version_id"):
             meta["modelVersionId"] = minfo["civitai_version_id"]
         if minfo.get("civitai_model_id"):
@@ -1519,9 +1547,13 @@ SDXL_IDLE_KILL_S = 300
 
 
 def _arm_sdxl_watchdog():
-    """Kill the SDXL daemon SDXL_IDLE_KILL_S after the last generation ends;
-    it is respawned lazily on the next generate call."""
+    """Kill the SDXL daemon after `idle_kill_s_sdxl` idle seconds; it is
+    respawned lazily on the next generate call. A setting of 0 disables."""
     global _sdxl_watchdog, _sdxl_idle_since
+    idle_s = _sdxl_idle_kill_s()
+    if idle_s <= 0:
+        _cancel_sdxl_watchdog()
+        return
     if _sdxl_watchdog is not None:
         _sdxl_watchdog.cancel()
     _sdxl_idle_since = time.time()
@@ -1546,7 +1578,7 @@ def _arm_sdxl_watchdog():
             _sdxl_watchdog = None
             _sdxl_idle_since = None
 
-    _sdxl_watchdog = threading.Timer(SDXL_IDLE_KILL_S, _kill)
+    _sdxl_watchdog = threading.Timer(idle_s, _kill)
     _sdxl_watchdog.daemon = True
     _sdxl_watchdog.start()
 
@@ -1564,10 +1596,30 @@ _mflux_idle_since = None
 MFLUX_IDLE_KILL_S = 300
 
 
+def _mflux_idle_kill_s() -> int:
+    """Effective mflux idle-kill seconds: persisted setting > built-in 300. 0 = never release."""
+    v = app_settings.get_setting("idle_kill_s_mflux")
+    if v is None:
+        return MFLUX_IDLE_KILL_S
+    return max(0, int(v))
+
+
+def _sdxl_idle_kill_s() -> int:
+    """Effective SDXL idle-kill seconds: persisted setting > built-in 300. 0 = never release."""
+    v = app_settings.get_setting("idle_kill_s_sdxl")
+    if v is None:
+        return SDXL_IDLE_KILL_S
+    return max(0, int(v))
+
+
 def _arm_mflux_watchdog():
-    """Release the resident mflux pipeline MFLUX_IDLE_KILL_S after the last
-    generation ends; it is reloaded lazily on the next generate call."""
+    """Release the resident mflux pipeline after `idle_kill_s_mflux` idle seconds;
+    reloaded lazily on the next generate call. A setting of 0 disables the watchdog."""
     global _mflux_watchdog, _mflux_idle_since
+    idle_s = _mflux_idle_kill_s()
+    if idle_s <= 0:
+        _cancel_mflux_watchdog()
+        return
     if _mflux_watchdog is not None:
         _mflux_watchdog.cancel()
     _mflux_idle_since = time.time()
@@ -1585,7 +1637,7 @@ def _arm_mflux_watchdog():
             _mflux_watchdog = None
             _mflux_idle_since = None
 
-    _mflux_watchdog = threading.Timer(MFLUX_IDLE_KILL_S, _release)
+    _mflux_watchdog = threading.Timer(idle_s, _release)
     _mflux_watchdog.daemon = True
     _mflux_watchdog.start()
 
@@ -1596,6 +1648,83 @@ def _cancel_mflux_watchdog():
         _mflux_watchdog.cancel()
         _mflux_watchdog = None
     _mflux_idle_since = None
+
+
+def rearm_engine_watchdogs():
+    """Reschedule any armed idle watchdogs with the current persisted settings.
+
+    Safe mid-flight: never touches a running generation or resident pipeline —
+    it only re-arms an already-armed watchdog that fires after a generation ends.
+    If a generation is currently running the lock is busy, so re-arming is
+    skipped; the persisted value still applies automatically on the next idle
+    arm (generations always re-arm watchdogs with the current settings).
+    """
+    global _mflux_watchdog, _mflux_idle_since, _sdxl_watchdog, _sdxl_idle_since
+    if not _lock.acquire(blocking=False):
+        return
+    try:
+        if _mflux_watchdog is not None and _mflux_watchdog.is_alive():
+            _mflux_watchdog.cancel()
+            pipe_ref = _pipeline
+            since = _mflux_idle_since
+            idle_s = _mflux_idle_kill_s()
+
+            def _release():
+                global _mflux_watchdog, _mflux_idle_since
+                with _lock:
+                    try:
+                        if _pipeline is pipe_ref and _pipeline is not None:
+                            _drop_mflux_pipeline()
+                            print("[mflux] watchdog: idle pipeline released", flush=True)
+                    except Exception:
+                        pass
+                    _mflux_watchdog = None
+                    _mflux_idle_since = None
+
+            if idle_s > 0:
+                _mflux_watchdog = threading.Timer(idle_s, _release)
+                _mflux_watchdog.daemon = True
+                _mflux_watchdog.start()
+                _mflux_idle_since = since
+            else:
+                _mflux_watchdog = None
+                _mflux_idle_since = None
+
+        if _sdxl_watchdog is not None and _sdxl_watchdog.is_alive():
+            _sdxl_watchdog.cancel()
+            proc = _sdxl_daemon
+            since = _sdxl_idle_since
+            idle_s = _sdxl_idle_kill_s()
+
+            def _kill():
+                global _sdxl_daemon, _sdxl_watchdog, _current_sdxl_model
+                with _lock:
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                            try:
+                                proc.wait(timeout=5.0)
+                            except subprocess.TimeoutExpired:
+                                pass
+                            print("[sdxl] watchdog: idle daemon terminated", flush=True)
+                    except Exception:
+                        pass
+                    if _sdxl_daemon is proc:
+                        _sdxl_daemon = None
+                        _current_sdxl_model = None
+                    _sdxl_watchdog = None
+                    _sdxl_idle_since = None
+
+            if idle_s > 0:
+                _sdxl_watchdog = threading.Timer(idle_s, _kill)
+                _sdxl_watchdog.daemon = True
+                _sdxl_watchdog.start()
+                _sdxl_idle_since = since
+            else:
+                _sdxl_watchdog = None
+                _sdxl_idle_since = None
+    finally:
+        _lock.release()
 
 
 def _drop_mflux_pipeline():

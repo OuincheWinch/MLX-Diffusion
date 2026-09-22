@@ -18,10 +18,52 @@ function gauge(label, value, title) {
   );
 }
 
+function normalizeNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function TuneInput({ label, unit, value, onChange, step, max = 128, title }) {
+  return (
+    <label className="engine-tune" title={title}>
+      <span>{label}</span>
+      <div className="engine-tune-input">
+        <input
+          type="number"
+          min="0"
+          max={max}
+          step={step ?? "any"}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        />
+        <small>{unit}</small>
+      </div>
+    </label>
+  );
+}
+
 export default function EngineSection() {
   const [status, setStatus] = useState(null);
   const [err, setErr] = useState(null);
   const [showStderr, setShowStderr] = useState(false);
+  const [draft, setDraft] = useState(() => ({
+    wiredGb: "",
+    kreaGb: "",
+    mfluxIdle: "",
+    sdxlIdle: "",
+  }));
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState(null);
+
+  const syncDraftFromStatus = (s) => {
+    setDraft({
+      wiredGb: String(s.wired?.generic_limit_gb ?? ""),
+      kreaGb: String(s.wired?.krea_limit_gb ?? ""),
+      mfluxIdle: String(s.mflux?.idle_kill_s ?? ""),
+      sdxlIdle: String(s.sdxl?.idle_kill_s ?? ""),
+    });
+  };
 
   useEffect(() => {
     let alive = true;
@@ -32,6 +74,7 @@ export default function EngineSection() {
         if (alive) {
           setStatus(s);
           setErr(null);
+          if (!dirty) syncDraftFromStatus(s);
         }
       } catch (e) {
         if (alive) setErr(e.message || String(e));
@@ -43,7 +86,44 @@ export default function EngineSection() {
       alive = false;
       clearTimeout(refreshTimer);
     };
-  }, []);
+  }, [dirty]);
+
+  async function saveConfig(e) {
+    e.preventDefault();
+    const payload = {};
+    const wiredGb = normalizeNum(draft.wiredGb);
+    const kreaGb = normalizeNum(draft.kreaGb);
+    const mfluxIdle = normalizeNum(draft.mfluxIdle);
+    const sdxlIdle = normalizeNum(draft.sdxlIdle);
+    if (wiredGb == null || kreaGb == null || mfluxIdle == null || sdxlIdle == null) {
+      setErr("All tuning values must be numbers (0 disables).");
+      return;
+    }
+    if (wiredGb < 0 || kreaGb < 0 || mfluxIdle < 0 || sdxlIdle < 0) {
+      setErr("Values must be ≥ 0.");
+      return;
+    }
+    payload.memory_wired_limit_gb = wiredGb;
+    payload.memory_krea_wired_limit_gb = kreaGb;
+    payload.idle_kill_s_mflux = Math.round(mfluxIdle);
+    payload.idle_kill_s_sdxl = Math.round(sdxlIdle);
+    setSaving(true);
+    setErr(null);
+    try {
+      const s = await api("/api/engine/config", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      setStatus(s);
+      setDirty(false);
+      setSavedAt(Date.now());
+      setTimeout(() => setSavedAt(null), 2600);
+    } catch (errMsg) {
+      setErr(errMsg.message || String(errMsg));
+    } finally {
+      setSaving(false);
+    }
+  }
 
   if (err) {
     return (
@@ -143,6 +223,59 @@ export default function EngineSection() {
               {showStderr && <pre className="engine-stderr">{sdxl.stderr_tail}</pre>}
             </>
           )}
+        </div>
+
+        <div className="engine-card">
+          <header>
+            <strong>⚙️ Runtime tuning</strong>
+          </header>
+          <p className="engine-tune-note">
+            Saved values take effect on the next generation (or the next idle
+            rearm) without restarting anything.
+          </p>
+          <form className="engine-tune-grid" onSubmit={saveConfig}>
+            <TuneInput
+              label="Wired limit"
+              unit="GB"
+              value={draft.wiredGb}
+              onChange={(v) => { setDraft((d) => ({ ...d, wiredGb: v })); setDirty(true); }}
+              step="0.5"
+              title="Metal allocator wired limit for FLUX.2 / SDXL (MLX_WIRED_LIMIT_GB). 0 = unbounded."
+            />
+            <TuneInput
+              label="krea2 wired"
+              unit="GB"
+              value={draft.kreaGb}
+              onChange={(v) => { setDraft((d) => ({ ...d, kreaGb: v })); setDirty(true); }}
+              step="0.5"
+              title="krea2 (13B q4) wired budget (MLX_KREA_WIRED_LIMIT_GB). 0 = unbounded."
+            />
+            <TuneInput
+              label="mflux idle"
+              unit="s"
+              value={draft.mfluxIdle}
+              onChange={(v) => { setDraft((d) => ({ ...d, mfluxIdle: v })); setDirty(true); }}
+              step="5"
+              max={86400}
+              title="Idle seconds before the mflux pipeline is auto-released. 0 = keep resident."
+            />
+            <TuneInput
+              label="sdxl idle"
+              unit="s"
+              value={draft.sdxlIdle}
+              onChange={(v) => { setDraft((d) => ({ ...d, sdxlIdle: v })); setDirty(true); }}
+              step="5"
+              max={86400}
+              title="Idle seconds before the SDXL daemon is killed. 0 = keep alive."
+            />
+            <div className="engine-tune-actions">
+              <button type="submit" className="btn-mini" disabled={saving || !dirty}>
+                {saving ? "Saving…" : "Save"}
+              </button>
+              {savedAt && <span className="engine-saved">Saved ✓</span>}
+              <span className="hint">0 = disabled / never auto-release</span>
+            </div>
+          </form>
         </div>
 
         <div className="engine-card">

@@ -209,6 +209,13 @@ def build_generation_metadata_text(meta: dict) -> str:
     if meta.get("fast_vae"):
         param_parts.append("Fast VAE: enabled")
 
+    ref_strength = meta.get("reference_strength")
+    if ref_strength is not None:
+        try:
+            param_parts.append(f"Denoising strength: {float(ref_strength):.3f}")
+        except (TypeError, ValueError):
+            param_parts.append(f"Denoising strength: {ref_strength}")
+
     aspect_val = compute_aspect_ratio(w, h)
     if minfo.get("ecosystem"):
         ecosystem = minfo["ecosystem"]
@@ -263,6 +270,11 @@ def build_generation_metadata_text(meta: dict) -> str:
         "generator": "MLX-DIFFUSION",
         "artist": _artist_fallback(meta.get("artist")),
     }
+    if ref_strength is not None:
+        try:
+            civitai_meta["denoisingStrength"] = float(ref_strength)
+        except (TypeError, ValueError):
+            pass
     param_parts.append(f"Civitai metadata: {json.dumps(civitai_meta, separators=(',', ':'))}")
 
     lines.append(", ".join(param_parts))

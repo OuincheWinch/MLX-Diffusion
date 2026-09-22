@@ -1,6 +1,11 @@
 import { memo } from "react";
 import { STANDARD_SIZES } from "../constants/sizes";
 
+function clampRefStrength(v) {
+  const n = Math.round((Number(v) + Number.EPSILON) * 100) / 100;
+  return Math.min(1, Math.max(0.01, n));
+}
+
 function GenerationParams({
   modelInfo,
   width,
@@ -256,17 +261,66 @@ function GenerationParams({
           </div>
 
           {refImages.length > 0 && !supportsMultiRef && (
-            <label className="ref-strength">
-              Strength {Number(refStrength).toFixed(2)}
+            <div className="ref-strength">
+              <div className="ref-strength-head">
+                <span className="ref-strength-label">KREA image ref strength</span>
+                <input
+                  className="ref-strength-input"
+                  type="number"
+                  min="0.01"
+                  max="1"
+                  step="0.01"
+                  value={Number(refStrength).toFixed(2)}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) setRefStrength(clampRefStrength(v));
+                  }}
+                />
+              </div>
               <input
                 type="range"
-                min="0.05"
-                max="0.95"
-                step="0.05"
-                value={refStrength}
-                onChange={(e) => setRefStrength(e.target.value)}
+                min="0.01"
+                max="1"
+                step="0.01"
+                value={Number(refStrength)}
+                onChange={(e) => setRefStrength(Number(e.target.value))}
               />
-            </label>
+              <div className="ref-strength-steps">
+                <button
+                  type="button"
+                  className="btn-mini"
+                  title="Decrease by 0.1"
+                  onClick={() => setRefStrength((v) => clampRefStrength(Number(v) - 0.1))}
+                >
+                  −0.1
+                </button>
+                <button
+                  type="button"
+                  className="btn-mini"
+                  title="Decrease by 0.01"
+                  onClick={() => setRefStrength((v) => clampRefStrength(Number(v) - 0.01))}
+                >
+                  −0.01
+                </button>
+                <span className="ref-strength-value">{Number(refStrength).toFixed(2)}</span>
+                <button
+                  type="button"
+                  className="btn-mini"
+                  title="Increase by 0.01"
+                  onClick={() => setRefStrength((v) => clampRefStrength(Number(v) + 0.01))}
+                >
+                  +0.01
+                </button>
+                <button
+                  type="button"
+                  className="btn-mini"
+                  title="Increase by 0.1"
+                  onClick={() => setRefStrength((v) => clampRefStrength(Number(v) + 0.1))}
+                >
+                  +0.1
+                </button>
+              </div>
+            </div>
           )}
           {supportsMultiRef && (
             <p className="hint">

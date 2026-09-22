@@ -59,6 +59,14 @@ DEFAULTS = {
         "krea2": "",
         "z-image-turbo": "",
     },
+    # Engine runtime tuning (None = fall back to env var / built-in default).
+    # GB wired limits for the Metal allocator; 0 = unbounded (env MLX_WIRED_LIMIT_GB,
+    # MLX_KREA_WIRED_LIMIT_GB). Idle kill seconds for the mflux/SDXL watchdogs;
+    # 0 = never auto-release. Applied lazily (next generation / idle rearm).
+    "memory_wired_limit_gb": None,
+    "memory_krea_wired_limit_gb": None,
+    "idle_kill_s_mflux": None,
+    "idle_kill_s_sdxl": None,
 }
 
 # Engine keys used by prompt_enhancer.ENGINE_PROFILES.
@@ -86,6 +94,10 @@ _VALIDATORS = {
     "model_paths": lambda v: isinstance(v, dict),
     "prompt_enhancer": lambda v: isinstance(v, dict),
     "prompt_enhancer_json": lambda v: isinstance(v, dict),
+    "memory_wired_limit_gb": lambda v: v is None or (isinstance(v, (int, float)) and 0 <= v <= 128),
+    "memory_krea_wired_limit_gb": lambda v: v is None or (isinstance(v, (int, float)) and 0 <= v <= 128),
+    "idle_kill_s_mflux": lambda v: v is None or (isinstance(v, int) and 0 <= v <= 86400),
+    "idle_kill_s_sdxl": lambda v: v is None or (isinstance(v, int) and 0 <= v <= 86400),
 }
 
 

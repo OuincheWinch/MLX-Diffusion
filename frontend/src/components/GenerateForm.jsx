@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../api";
+import { api, API_BASE } from "../api";
 import GenerationStack from "./GenerationStack";
 import ResultCanvas from "./ResultCanvas";
 import UniversalDownloader from "./UniversalDownloader";
@@ -431,7 +431,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
         const res = await api("/api/uploads", { method: "POST", body: form });
         const isHeic = /\.(heic|heif)$/i.test(file.name || "");
         // Use res.url (served as PNG by backend) for HEIC and when available so all browsers render it
-        const previewUrl = res.url || (isHeic ? "" : URL.createObjectURL(file));
+        const previewUrl = res.url ? `${API_BASE}${res.url}` : isHeic ? "" : URL.createObjectURL(file);
         setRefImages((prev) => {
           if (prev.length >= maxRefImages) return prev;
           return [
