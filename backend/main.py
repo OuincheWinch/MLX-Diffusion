@@ -14,6 +14,7 @@ from state import (
     _init_gallery_index,
 )
 from routers import jobs, gallery, loras, tokens, uploads, downloads, settings as settings_router
+import app_version
 
 
 import threading
@@ -33,7 +34,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="MLX-DIFFUSION", lifespan=lifespan)
+app = FastAPI(title="MLX-Diffusion", version=app_version.APP_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,3 +54,16 @@ app.include_router(tokens.router)
 app.include_router(uploads.router)
 app.include_router(downloads.router)
 app.include_router(settings_router.router)
+
+
+@app.get("/api/version")
+def api_version():
+    return {
+        "name": app_version.APP_NAME,
+        "version": app_version.APP_VERSION,
+        "version_label": app_version.APP_VERSION_LABEL,
+        "author": app_version.APP_AUTHOR,
+        "website": app_version.APP_WEBSITE,
+        "repo": app_version.APP_REPO,
+        "ai_credits": app_version.AI_CREDITS,
+    }

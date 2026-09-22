@@ -272,10 +272,8 @@ MODELS = {
         "supports_ref": True,
         "supports_fast_vae": True,
         "lora_format": "Krea 2",
-        # 16GB M1 OOM guard: 3D causal VAE decode requires high activation memory.
-        # Safe resolution: 512x512 / 512x768. Hard pixel budget: 512x768 (393k px), max side 768.
-        "max_pixels": 393216,
-        "max_side": 768,
+        # Size caps removed 2026-09-22 (user decision). 16GB M1 note: the 3D
+        # causal VAE decode has high activation memory; very large sizes may OOM.
         "presets": [
             {"id": "draft", "label": "⚡ Fast Draft 4-step (512×768)", "width": 512, "height": 768, "steps": 4},
             {"id": "turbo", "label": "✦ 8-step Quality (~3min)", "width": 512, "height": 512, "steps": 8},
@@ -285,28 +283,25 @@ MODELS = {
     },
     "qwen-image-2.1": {
         "id": "qwen-image-2.1",
-        "label": "Qwen-Image 2.1 (MLX q4)",
+        "label": "Qwen-Image 2.1 (MLX q4, experimental)",
         "repo": "mlx-community/Qwen-Image-2.1-MLX-4bit",
         # mflux-community/mflux fork (Qwen-Image-2.1 port, PR #736) patched to load the
         # pre-quantized mlx-community repo with a QUANTIZED Qwen3-VL text encoder.
         # Upstream hard-codes the TE at bf16 (~17.5GB resident) which can't fit 16GB.
         "ecosystem": "Qwen-Image 2.1",
-        "default_steps": 40,
+        "default_steps": 25,
         "default_guidance": 1.0,
         "supports_guidance": True,
         "supports_negative": True,
         "supports_loras": False,
         "supports_ref": True,  # single-image img2img (denoise strength)
         "supports_fast_vae": False,
-        # 16GB M1 OOM guard: q4 pipeline is ~10.5GB resident; 1024² OOMs in the bf16
-        # VAE decode, so the hard cap defaults to the tested-safe 512×768 area (393216px).
-        # Editable per-request from the UI (max_pixels), clamped to this model ceiling.
-        "max_pixels": 393216,
-        "max_side": 768,
+        # Size caps removed 2026-09-22 (user decision). 16GB M1 note: the q4
+        # pipeline is ~10.5GB resident; 1024² can OOM in the bf16 VAE decode.
         "presets": [
-            {"id": "draft", "label": "⚡ Fast Draft (512×768)", "width": 512, "height": 768, "steps": 24},
-            {"id": "quality", "label": "✦ Quality (768×512, 40 steps)", "width": 768, "height": 512, "steps": 40},
-            {"id": "portrait", "label": "▮ Portrait (512×768, 40 steps)", "width": 512, "height": 768, "steps": 40},
+            {"id": "draft", "label": "⚡ Fast Draft (512×768, 25s)", "width": 512, "height": 768, "steps": 25},
+            {"id": "quality", "label": "✦ Quality (768×512, 40s euler)", "width": 768, "height": 512, "steps": 40},
+            {"id": "portrait", "label": "▮ Portrait (512×768, 40s euler)", "width": 512, "height": 768, "steps": 40},
         ],
     },
 }
@@ -1233,6 +1228,15 @@ def generate(
     """Blocking generation. Caller must hold no other heavy work."""
     loras = _enrich_loras_with_registry(loras)
     minfo = get_model_info(model)
+    if minfo["id"] == "qwen-image-2.1":
+        # Size caps were removed 2026-09-22 (user decision), but 1024² CONFIRMED
+        # OOM in the bf16 VAE decode on 16GB (Metal kIOGPU...OutOfMemory) and can
+        # wedge the worker. Refuse the >768² envelope with a clean error instead.
+        if width * height > 589824:  # 768×768 = 589824 px
+            raise ValueError(
+                f"{minfo['label']}: resolutions above 768×768 (589k px) OOM the bf16 VAE "
+                f"decode on 16GB Apple Silicon and can crash the app. Keep ≤ 512×768 / 768×512 / 768×768."
+            )
     if minfo.get("engine") == "sdxl":
         chosen_sampler = sampler or (minfo.get("samplers")[0] if minfo.get("samplers") else "euler_trailing")
         return _generate_sdxl(
@@ -1507,6 +1511,7 @@ def generate(
                         {
                             "negative_prompt": negative_prompt or None,
                             "guidance": eff_guidance,
+                            "scheduler": "flow_match_euler_discrete",  # validated recipe (linear is visibly worse)
                         }
                     )
                 out = pipe.generate_image(**gen_kwargs)

@@ -1,9 +1,15 @@
 # MLX-Diffusion
 
+**Beta — v0.1.1**
+
 ![MLX-DIFFUSION on MacBook Pro](frontend/src/assets/MLX-DIFFUSION_ON_MBP.png)
 
 **A private, on-device image generation studio for Apple Silicon.**
 Benchmarked and tuned on a **2021 MacBook Pro M1 with 16 GB of Unified Memory** — no cloud account, no upload, no GPU farm. Your prompts and your images never leave the machine.
+
+> **Public beta notice** — this codebase is in active development. Engines marked *experimental* (e.g. Qwen-Image 2.1) are unsupported previews and can be slow, inconsistent, or crash above 768×768 on 16 GB machines. GitHub Issues are welcome.
+
+Crafted by **[Ouinche](https://www.ouinche.com)** — heavily coded by AI (Gemini, 0xAlpha, Big Pickle)—released under [MIT](LICENSE).
 
 ---
 
@@ -190,4 +196,6 @@ Ports are fixed — **8001** and **5174** (8000 and 5173 belong to other local t
 
 ## License
 
-[MIT](LICENSE) — covers this project's source code only. Model weights carry their own terms (e.g. FLUX.2-klein is Black Forest Labs Non-Commercial); checkpoints are not covered by this license.
+[MIT](LICENSE) — Copyright © 2026 **[Ouinche](https://www.ouinche.com)**. Covers this project's source code only. Model weights carry their own terms (e.g. FLUX.2-klein is Black Forest Labs Non-Commercial; Juggernaut XL is non-commercial); checkpoints are not covered by this license and are **not redistributed** by this project — they are downloaded on first use.
+
+The app shows the full per-package and per-model licences in the **⚖ Licences** tab. Package identifiers were verified from the installed distribution metadata.

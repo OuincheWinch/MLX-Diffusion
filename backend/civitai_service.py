@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Any
 
 CIVITAI_API_BASE = "https://civitai.com/api/v1"
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 MLX-DIFFUSION/1.0"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 MLX-Diffusion/0.1.1"
 
 
 class CivitaiAuthError(RuntimeError):

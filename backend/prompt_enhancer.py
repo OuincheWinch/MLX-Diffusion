@@ -78,6 +78,7 @@ ENGINE_PROFILES = {
     "flux2": {
         "label": "FLUX.2 Klein (T5 Narrative)",
         "length": "40 to 75 words",
+        "max_words": 75,
         "instructions": (
             "Target Engine: FLUX.2 Klein 4B (mflux/MLX; guidance-distilled flow-matching DiT with a T5 text encoder).\n"
             "Official prompting style (BFL Prompting Guide) — NARRATIVE PROSE built on Subject + Action + Style + Context:\n"
@@ -102,6 +103,7 @@ ENGINE_PROFILES = {
     "sdxl": {
         "label": "SDXL Lightning / Juggernaut XL (Dual CLIP)",
         "length": "40 to 55 words",
+        "max_words": 55,
         "instructions": (
             "Target Engine: SDXL Lightning / Juggernaut XL (distilled UNet; dual OpenCLIP-G + CLIP-L text encoders, "
             "77 tokens per chunk).\n"
@@ -125,6 +127,7 @@ ENGINE_PROFILES = {
     "krea2": {
         "label": "Krea 2 Turbo (Deep Causal Latent)",
         "length": "50 to 90 words",
+        "max_words": 90,
         "instructions": (
             "Target Engine: Krea 2 Turbo 13B (natural-language foundation model; local raw/turbo weights, no hosted expander).\n"
             "Official prompting style (Krea prompting.md) — NATURAL LANGUAGE, long and specific:\n"
@@ -146,6 +149,7 @@ ENGINE_PROFILES = {
     "z-image-turbo": {
         "label": "Z-Image Turbo 6B (S3-DiT)",
         "length": "80 to 200 words",
+        "max_words": 200,
         "instructions": (
             "Target Engine: Z-Image Turbo 6B (single-stream S3-DiT; ~512-token default text cap; guidance_scale 0; "
             "no negative prompt).\n"
@@ -322,15 +326,17 @@ def _text_task_block(profile: Dict[str, Any]) -> str:
         f"({profile['length']}).\n"
         "Do NOT just repeat or capitalize the user concept as-is. Elaborate on the lighting, environment, "
         "textures, and composition.\n\n"
-        "GENERAL RULES (compiled prompt-engineering best practices):\n"
-        "1. Output ONLY the raw enhanced prompt. Never output commentary, conversational preambles, "
-        "explanations, JSON, bullets, or quotes around the whole prompt.\n"
-        "2. Preserve the core subject, action, and intent of the original user prompt without replacing it "
+        "STRONG OUTPUT RULES (NEVER violate — your response goes straight into the image engine):\n"
+        "1. Your ENTIRE response is the enhanced prompt and NOTHING else. One continuous block. No preamble "
+        "('Here is...', 'Enhanced prompt:'), no explanation, no commentary, no apology, no JSON, no bullets, "
+        "no quotes or markdown around the whole prompt, and no closing remark.\n"
+        f"2. HARD LENGTH CAP: at most {profile['max_words']} words. Stop the instant the prompt is complete — "
+        "never pad, never continue, never summarize. A focused prompt beats a padded one.\n"
+        "3. Preserve the core subject, action, and intent of the original user prompt without replacing it "
         "or inventing new subjects/props/characters unless clearly implied.\n"
-        "3. If the user already wrote a detailed prompt, polish and finalize lightly instead of heavily "
+        "4. If the user already wrote a detailed prompt, polish and finalize lightly instead of heavily "
         "expanding — respect their phrasing and direction.\n"
-        "4. Keep the output cohesive, vivid, and free of tag repetition.\n"
-        f"5. Length target: {profile['length']}."
+        "5. Keep the output cohesive, vivid, and free of tag repetition."
     )
 
 

@@ -520,6 +520,16 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     return yiq >= 128 ? "#111" : "#fff";
   }
 
+  function qwenLaunchBlocked() {
+    if (model !== "qwen-image-2.1") return false;
+    return !window.confirm(
+      "Qwen-Image 2.1 is EXPERIMENTAL on this Mac. Launch anyway?\n\n" +
+        "• Slow: ~8–14 minutes per 512×768 image.\n" +
+        "• Results are inconsistent (soft/blurry on complex scenes).\n" +
+        "• Resolutions above 768×768 crash the pipeline (out of memory) and may wedge the app."
+    );
+  }
+
   async function postGenerate(isQueued = false) {
     const paramsStr = currentParams();
     let parsedPrompt = prompt;
@@ -541,6 +551,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
 
   async function handleVariation(meta) {
     if (!meta) return;
+    if (qwenLaunchBlocked()) return;
     const newSeed = getNextSeed(meta.seed ?? seed);
     setSeed(newSeed);
     try {
@@ -568,6 +579,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
       if (dirty) setShowSwitchDialog(true);
       return;
     }
+    if (qwenLaunchBlocked()) return;
     try {
       setSubmittedParams(currentParams());
       await postGenerate(false);
@@ -578,6 +590,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
 
   async function queueNext() {
     setShowSwitchDialog(false);
+    if (qwenLaunchBlocked()) return;
     setSubmittedParams(currentParams());
     try {
       await postGenerate(true);
@@ -698,9 +711,9 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
                 className="color-tool-btn"
                 onClick={handleEnhancePrompt}
                 disabled={enhancing || !prompt.trim()}
-                title="Adaptive AI Prompt Enhancer (Qwen 0.5B local LLM)"
+                title="Adaptive AI Prompt Enhancer — EXPERIMENTAL (Qwen 0.5B local LLM). Returns only the prompt, length-capped per engine, no commentary."
               >
-                {enhancing ? "✨ Enhancing…" : "✨ Enhance"}
+                {enhancing ? "✨ Enhancing…" : "✨ Enhance (experimental)"}
               </button>
               {enhancing && (
                 <button
@@ -1058,7 +1071,9 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
                 : "An image is currently being generated."}{" "}
               The prompt enhancer runs a second local model on the same Apple Silicon
               GPU and unified memory, so enhancing now can slow the current job and take
-              longer itself. You can cancel the enhancement at any time.
+              longer itself. You can cancel the enhancement at any time. Note: the
+              enhancer is experimental — output is cap-length to the engine profile and
+              stripped of any commentary, but quality varies.
             </p>
             <div className="detail-actions">
               <button

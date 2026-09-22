@@ -52,6 +52,63 @@ header h1 {
   letter-spacing: 0.08em;
 }
 
+.version-badge {
+  display: inline-block;
+  margin-top: 0.2rem;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.licences-tab {
+  max-width: 940px;
+}
+
+.licence-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.licence-table th,
+.licence-table td {
+  text-align: left;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.licence-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.licence-table a {
+  color: var(--accent);
+  word-break: break-all;
+}
+
+.licence-caution {
+  color: #ffb454;
+}
+
+.licence-extra {
+  font-size: 0.76rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+}
+
+.licence-hint {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
 nav button {
   background: none;
   border: none;

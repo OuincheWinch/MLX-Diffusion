@@ -67,17 +67,19 @@ export default function ParametersTab({ onNavigate }) {
           className={`params-subtab${subtab === "enhancer" ? " active" : ""}`}
           onClick={() => setSubtab("enhancer")}
         >
-          🧠 Prompt Enhancer Prompts
+          🧠 Prompt Enhancer Prompts (experimental)
         </button>
       </div>
 
       {subtab === "enhancer" ? (
         <section className="params-section">
-          <h3>🧠 Prompt Enhancer — System Prompts</h3>
+          <h3>🧠 Prompt Enhancer — System Prompts (experimental)</h3>
           <p className="params-section-desc">
             Customize the system prompt the local LLM (Qwen2.5-0.5B-Instruct via MLX) uses when
             you click ✨ Enhance. One editable prompt per engine — FLUX.2 Klein, SDXL Lightning,
             Krea 2 Turbo and Z-Image Turbo. Saved overrides are used immediately by the enhancer.
+            The enforced contract is prompt-only output within each engine's length cap (no
+            preamble, no explanation), but the feature itself is experimental.
           </p>
           <EnhancerSystemSection onFeedback={handleFeedback} onSaved={refresh} />
         </section>
