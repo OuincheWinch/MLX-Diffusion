@@ -34,8 +34,19 @@ function GenerationParams({
   pickRefImages,
   removeRefImage,
   insertIntoPrompt,
+  maxPixels,
+  setMaxPixels,
 }) {
   const maxRefImages = supportsMultiRef ? 10 : 1;
+  const haveHardCap = Boolean(maxPixels && modelInfo.max_pixels);
+  // Filter the size dropdown to resolutions that fit the editable hard cap (win/win:
+  // protects the VAE decode budget while still letting users loosen the cap).
+  const cappedSizes = haveHardCap
+    ? STANDARD_SIZES.filter((s) => {
+        const [w, h] = s.value.split("x").map(Number);
+        return w * h <= Number(maxPixels);
+      })
+    : STANDARD_SIZES;
 
   function randomizeSeed() {
     setSeed("");
@@ -62,12 +73,12 @@ function GenerationParams({
                 setHeight(h);
               }}
             >
-              {!STANDARD_SIZES.some((s) => s.value === `${width}x${height}`) && (
+              {!cappedSizes.some((s) => s.value === `${width}x${height}`) && (
                 <option value={`${width}x${height}`}>
                   ✦ {width} × {height} (Preset)
                 </option>
               )}
-              {STANDARD_SIZES.map((s) => (
+              {cappedSizes.map((s) => (
                 <option key={s.value} value={s.value}>
                   {s.label}
                 </option>
@@ -87,6 +98,38 @@ function GenerationParams({
             </span>
           </div>
         </label>
+
+        {modelInfo.max_pixels ? (
+          <label>
+            <span className="step-label-header">
+              Max pixels (hard cap)
+              <span
+                className="distill-subtle-tag"
+                title="Hard ceiling enforced by the backend. Lower it to protect Apple Silicon memory (Qwen's bf16 VAE decode OOMs past ~512×768 on 16GB)."
+              >
+                ⚙ OOM guard
+              </span>
+            </span>
+            <input
+              type="number"
+              min="65536"
+              max={modelInfo.max_pixels}
+              step="16384"
+              value={Number(maxPixels) || modelInfo.max_pixels}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (!e.target.value) return;
+                const clamped = Math.max(65536, Math.min(Number(modelInfo.max_pixels), Math.round(v)));
+                setMaxPixels(clamped);
+                const ratio = Math.sqrt(clamped / (Number(width) * Number(height)));
+                if (Number(width) * Number(height) > clamped) {
+                  setWidth(Math.max(256, Math.round(Number(width) * ratio / 16) * 16));
+                  setHeight(Math.max(256, Math.round(Number(height) * ratio / 16) * 16));
+                }
+              }}
+            />
+          </label>
+        ) : null}
 
         <label>
           <span className="step-label-header">

@@ -298,13 +298,15 @@ MODELS = {
         "supports_loras": False,
         "supports_ref": True,  # single-image img2img (denoise strength)
         "supports_fast_vae": False,
-        # 16GB M1 OOM guard: q4 pipeline is ~10.5GB resident; keep 1024² as ceiling.
-        "max_pixels": 1048576,
-        "max_side": 1024,
+        # 16GB M1 OOM guard: q4 pipeline is ~10.5GB resident; 1024² OOMs in the bf16
+        # VAE decode, so the hard cap defaults to the tested-safe 512×768 area (393216px).
+        # Editable per-request from the UI (max_pixels), clamped to this model ceiling.
+        "max_pixels": 393216,
+        "max_side": 768,
         "presets": [
             {"id": "draft", "label": "⚡ Fast Draft (512×768)", "width": 512, "height": 768, "steps": 24},
-            {"id": "quality", "label": "✦ Quality (768×768, 40 steps)", "width": 768, "height": 768, "steps": 40},
-            {"id": "full", "label": "✦ Full HD (1024×1024, 40 steps)", "width": 1024, "height": 1024, "steps": 40},
+            {"id": "quality", "label": "✦ Quality (768×512, 40 steps)", "width": 768, "height": 512, "steps": 40},
+            {"id": "portrait", "label": "▮ Portrait (512×768, 40 steps)", "width": 512, "height": 768, "steps": 40},
         ],
     },
 }
@@ -1226,6 +1228,7 @@ def generate(
     output_format: str = "png",
     stealth: bool = False,
     fast_vae: bool = True,
+    max_pixels: int | None = None,  # per-request overridable hard pixel cap (defaults to model max_pixels)
 ) -> dict:
     """Blocking generation. Caller must hold no other heavy work."""
     loras = _enrich_loras_with_registry(loras)
@@ -1337,15 +1340,18 @@ def generate(
         )
     if not minfo["supports_guidance"]:
         guidance = None
-    # OOM guard for memory-heavy models (16GB M1): clamp to the model's
-    # pixel budget instead of letting Metal thrash / crash the daemon.
     max_side = minfo.get("max_side")
-    max_pixels = minfo.get("max_pixels")
+    cap_pixels = minfo.get("max_pixels")
+    # A per-request override can tighten the model's pixel budget further
+    # (never loosen it), e.g. Qwen-Image 2.1's 512×768-safe default that the
+    # UI lets users tune (max_pixels from the frontend params tab).
+    if max_pixels is not None and (cap_pixels is None or max_pixels < cap_pixels):
+        cap_pixels = max_pixels
     if max_side:
         width = min(width, max_side)
         height = min(height, max_side)
-    if max_pixels and width * height > max_pixels:
-        scale = (max_pixels / (width * height)) ** 0.5
+    if cap_pixels and width * height > cap_pixels:
+        scale = (cap_pixels / (width * height)) ** 0.5
         width = max(256, int(width * scale) // 16 * 16)
         height = max(256, int(height * scale) // 16 * 16)
     with _lock:
@@ -1491,8 +1497,18 @@ def generate(
                     "image_strength": image_strength,
                 }
                 if model == "qwen-image-2.1":
-                    # true CFG on the Qwen-Image 2.1 port: guidance > 1 + negative prompt
-                    gen_kwargs["negative_prompt"] = negative_prompt or None
+                    # true CFG on the Qwen-Image 2.1 port only engages when guidance > 1
+                    # (noise = neg + g*(pos - neg)). Auto-raise guidance when a negative
+                    # prompt is supplied so it actually takes effect instead of being skipped.
+                    eff_guidance = guidance if guidance is not None else 1.0
+                    if negative_prompt and eff_guidance <= 1.0:
+                        eff_guidance = 3.0
+                    gen_kwargs.update(
+                        {
+                            "negative_prompt": negative_prompt or None,
+                            "guidance": eff_guidance,
+                        }
+                    )
                 out = pipe.generate_image(**gen_kwargs)
             infer_time = round(time.time() - t_infer_start, 2)
         finally:

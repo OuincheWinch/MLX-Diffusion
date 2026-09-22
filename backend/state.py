@@ -129,6 +129,7 @@ class GenerateRequest(BaseModel):
     output_format: str = "png"
     stealth: bool = False
     fast_vae: bool = True
+    max_pixels: int | None = Field(default=None, ge=256 * 256, le=2048 * 2048)
 
 
 class TokenRequest(BaseModel):
@@ -364,6 +365,7 @@ def _worker():
                         output_format=req.output_format,
                         stealth=req.stealth,
                         fast_vae=req.fast_vae,
+                        max_pixels=req.max_pixels,
                     )
                     results.append(meta)
                     with _gallery_lock:

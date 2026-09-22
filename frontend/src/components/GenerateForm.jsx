@@ -129,6 +129,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
   const [outputFormat, setOutputFormat] = useState("png");
   const [stealthMode, setStealthMode] = useState(false);
   const [fastVae, setFastVae] = useState(true);
+  const [maxPixels, setMaxPixels] = useState(null);
   const [enhancing, setEnhancing] = useState(false);
   const [enhanceJson, setEnhanceJson] = useState(false);
   const [showEnhanceWarning, setShowEnhanceWarning] = useState(false);
@@ -178,6 +179,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
       if (initialParams.format) setOutputFormat(initialParams.format);
       if (initialParams.stealth != null) setStealthMode(Boolean(initialParams.stealth));
       if (initialParams.fast_vae != null) setFastVae(Boolean(initialParams.fast_vae));
+      if (initialParams.max_pixels) setMaxPixels(initialParams.max_pixels);
       if (initialParams.sampler && matched?.samplers?.includes(initialParams.sampler)) {
         setSampler(initialParams.sampler);
       }
@@ -242,6 +244,8 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     onModelChange?.(m.label);
     const defSteps = m.default_steps ?? (id === "z-image-turbo" || id === "krea2-turbo" ? 8 : 4);
     setSteps(defSteps);
+    // Reset the editable hard pixel cap to this model's ceiling on engine switch
+    setMaxPixels(m.max_pixels && m.max_side ? m.max_pixels : null);
     if (m.presets && m.presets.length > 0) {
       if ((m.max_pixels && width * height > m.max_pixels) || id === "krea2-turbo" || id === "z-image-turbo") {
         setWidth(m.presets[0].width);
@@ -306,6 +310,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
       if (p.batch != null) setBatch(p.batch);
       if (p.sampler != null) setSampler(p.sampler);
       if (p.fast_vae != null) setFastVae(p.fast_vae);
+      if (p.max_pixels) setMaxPixels(p.max_pixels);
       if (Array.isArray(p.loras)) setLoras(p.loras);
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
@@ -351,6 +356,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
       output_format: outputFormat,
       stealth: stealthMode,
       fast_vae: fastVae,
+      max_pixels: maxPixels && maxPixels < (modelInfo.max_pixels ?? Infinity) ? Number(maxPixels) : null,
     });
 
   async function runEnhancePrompt() {
@@ -885,6 +891,8 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
             pickRefImages={pickRefImages}
             removeRefImage={removeRefImage}
             insertIntoPrompt={insertIntoPrompt}
+            maxPixels={maxPixels}
+            setMaxPixels={setMaxPixels}
           />
       {modelInfo.lora_format ? (
         <LoraManagerDrawer
