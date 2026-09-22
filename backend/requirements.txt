@@ -10,7 +10,9 @@ python-multipart>=0.0.12
 
 # Apple Silicon MLX & Models
 mlx>=0.22.0
-mflux>=0.19.0
+# Qwen-Image 2.1 requires the patched mflux fork (PR #736, + 16GB TE/quant fixes);
+# install from repo checkout: `python -m pip install ./mflux --no-deps`
+mflux>=0.20.0
 mlx-lm>=0.31.0
 mlx-taef>=0.8.0
 mlx-teacache>=0.11.0

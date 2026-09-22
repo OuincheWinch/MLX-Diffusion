@@ -283,6 +283,30 @@ MODELS = {
             {"id": "fast", "label": "⚡ Fast 4-step (~1.5min)", "width": 512, "height": 512, "steps": 4},
         ],
     },
+    "qwen-image-2.1": {
+        "id": "qwen-image-2.1",
+        "label": "Qwen-Image 2.1 (MLX q4)",
+        "repo": "mlx-community/Qwen-Image-2.1-MLX-4bit",
+        # mflux-community/mflux fork (Qwen-Image-2.1 port, PR #736) patched to load the
+        # pre-quantized mlx-community repo with a QUANTIZED Qwen3-VL text encoder.
+        # Upstream hard-codes the TE at bf16 (~17.5GB resident) which can't fit 16GB.
+        "ecosystem": "Qwen-Image 2.1",
+        "default_steps": 40,
+        "default_guidance": 1.0,
+        "supports_guidance": True,
+        "supports_negative": True,
+        "supports_loras": False,
+        "supports_ref": True,  # single-image img2img (denoise strength)
+        "supports_fast_vae": False,
+        # 16GB M1 OOM guard: q4 pipeline is ~10.5GB resident; keep 1024² as ceiling.
+        "max_pixels": 1048576,
+        "max_side": 1024,
+        "presets": [
+            {"id": "draft", "label": "⚡ Fast Draft (512×768)", "width": 512, "height": 768, "steps": 24},
+            {"id": "quality", "label": "✦ Quality (768×768, 40 steps)", "width": 768, "height": 768, "steps": 40},
+            {"id": "full", "label": "✦ Full HD (1024×1024, 40 steps)", "width": 1024, "height": 1024, "steps": 40},
+        ],
+    },
 }
 
 
@@ -1112,6 +1136,17 @@ def _get_pipeline(model_id: str, quantization: int, loras: list[dict], variant: 
             mx.eval(_pipeline.text_encoder)
             mx.clear_cache()
             gc.collect()
+    elif model_id == "qwen-image-2.1":
+        from mflux.models.qwen21.variants.txt2img.qwen_image_21 import QwenImage21
+
+        # mlx-community repo ships EVERYTHING pre-quantized (TE q4 + transformer q4 +
+        # VAE bf16). The fork's qwen21_initializer rebuilds packed layers as
+        # QuantizedLinear/QuantizedEmbedding at load (patch) and, with the TE
+        # skip_quantization/precision overrides, keeps them quantized - no bf16 TE.
+        _pipeline = QwenImage21(
+            quantize=quantization,
+            model_path=local_arg or info["repo"],
+        )
     else:
         raise ValueError(f"unknown model: {model_id}")
     _current_pipeline_key = key
@@ -1214,9 +1249,9 @@ def generate(
                 ref_paths.append(p.strip())
 
     if ref_paths:
-        if minfo["id"] not in ("flux2-klein-4b", "flux2-klein-9b", "z-image-turbo", "krea2-turbo"):
+        if minfo["id"] not in ("flux2-klein-4b", "flux2-klein-9b", "z-image-turbo", "krea2-turbo", "qwen-image-2.1"):
             raise ValueError(
-                f"Reference images are not supported on {minfo['label']} (FLUX.2-klein / Z-Image / Krea2 only)")
+                f"Reference images are not supported on {minfo['label']} (FLUX.2-klein / Z-Image / Krea2 / Qwen-Image 2.1 only)")
         if len(ref_paths) > 1 and minfo["id"] not in ("flux2-klein-4b", "flux2-klein-9b"):
             raise ValueError(
                 f"Multi-reference images (up to 10) are currently supported on FLUX.2-klein only"
@@ -1365,7 +1400,9 @@ def generate(
         prev_wired = None
         restore_callbacks = []
         try:
-            if model == "krea2-turbo":
+            if model == "krea2-turbo" or model == "qwen-image-2.1":
+                # qwen21 shares krea2's bigger 68% wired budget: its q4 pipeline is
+                # ~10.5GB resident and the generic 45% cap starves the load.
                 limit = _krea_wired_limit_bytes()
             else:
                 limit = _wired_limit_bytes()
@@ -1453,6 +1490,9 @@ def generate(
                     "image_path": ref_paths[0] if ref_paths else None,
                     "image_strength": image_strength,
                 }
+                if model == "qwen-image-2.1":
+                    # true CFG on the Qwen-Image 2.1 port: guidance > 1 + negative prompt
+                    gen_kwargs["negative_prompt"] = negative_prompt or None
                 out = pipe.generate_image(**gen_kwargs)
             infer_time = round(time.time() - t_infer_start, 2)
         finally:
