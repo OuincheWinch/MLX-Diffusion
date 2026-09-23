@@ -27,7 +27,25 @@ Ports (do not change — 8000 / 5173 are reserved by other local tools):
 ==========================================================================
 2. QUICK START (RECOMMENDED)
 ==========================================================================
-From the project root, launch everything with one command:
+Full install + launch, from the project root (the folder containing run.sh,
+backend/ and frontend/):
+
+Step 1 — create the two Python virtual environments (both are required:
+the main engine venv `venv/` and the isolated SDXL engine `venv-sdxl/`):
+
+    python3 -m venv venv
+    python3 -m venv venv-sdxl
+
+Step 2 — install the Python dependencies into each venv:
+
+    ./venv/bin/python -m pip install -r backend/requirements.txt
+    ./venv-sdxl/bin/python -m pip install -r backend/requirements-sdxl.txt
+
+Step 3 — install the frontend dependencies:
+
+    cd frontend && npm install && cd ..
+
+Step 4 — launch everything with one command:
 
     ./run.sh
 
@@ -39,10 +57,17 @@ run.sh will:
 4. open http://localhost:5174 in your default browser,
 5. stop backend + frontend + SDXL engine cleanly on Ctrl+C.
 
-One-time setup before the first run:
-    ./venv/bin/python -m pip install -r backend/requirements.txt
-    ./venv-sdxl/bin/python -m pip install -r backend/requirements-sdxl.txt
-    cd frontend && npm install && cd ..
+Your first generation downloads the model weights (~2–3 GB, allow ~20 min)
+into the Hugging Face cache — afterwards everything runs fully offline.
+
+Suggested first prompt (works with FLUX.2-klein 4B, Z-Image Turbo 6B or
+Krea 2 Turbo 13B):
+
+    "A mischievous baby otter wearing a tiny yellow developer helmet, sitting
+     in front of a futuristic glowing computer setup. The glowing computer
+     screen clearly displays the words "HELLO WORLD" in vibrant neon text.
+     Warm studio lighting, shallow depth of field, 8k resolution, cinematic
+     photorealism."
 
 
 ==========================================================================
@@ -79,7 +104,24 @@ immediately:  pkill -f sdxl_engine.py
 
 
 ==========================================================================
-5. SUPPORTED MODELS (ALL QUANTIZED FOR 16 GB UNIFIED MEMORY)
+5. UNINSTALL (FULL REMOVAL)
+==========================================================================
+Ensure your terminal is open inside the project folder you wish to remove:
+
+    cd /path/to/your/project-folder
+    cd .. && rm -rf MLX-Diffusion
+
+Purge the leftover caches so nothing lingers on the machine:
+
+    # purge pip cache (clears wheels and downloaded python packages)
+    python3 -m pip cache purge
+
+    # clear npm global cache
+    npm cache clean --force
+
+
+==========================================================================
+6. SUPPORTED MODELS (ALL QUANTIZED FOR 16 GB UNIFIED MEMORY)
 ==========================================================================
 1. FLUX.2-klein 4B  (main engine — Black Forest Labs DiT)
    - id flux2-klein-4b  ·  ideal 4 steps  ·  guidance 1.0 (guidance-distilled,
@@ -114,7 +156,7 @@ Swapping models automatically unloads incompatible LoRAs to avoid crashes.
 
 
 ==========================================================================
-6. PROMPT ENHANCER ("✨ Enhance")
+7. PROMPT ENHANCER (
 ==========================================================================
 Local 4-bit LLM (Qwen2.5-0.5B-Instruct via mlx-lm) — fully offline, ~0.5–1 s,
 <350 MB RAM, no cloud call.
@@ -135,7 +177,7 @@ with an enriched, engine-adapted description in ~1 s.
 
 
 ==========================================================================
-7. LoRAs & CIVITAI IMPORT
+8. LoRAs & CIVITAI IMPORT
 ==========================================================================
 - Add LoRA: drag & drop a .safetensors onto the form, or use "+ Add LoRA…"
   (only compatible architectures are offered).
@@ -157,7 +199,7 @@ Model install from an already-downloaded copy (no re-download):
 
 
 ==========================================================================
-8. STUDIO & GALLERY
+9. STUDIO & GALLERY
 ==========================================================================
 - Split-screen studio: generation form (left) + interactive canvas (right).
 - Upscaling: ✨ AI Neural 2x (SeedVR2 latent 1-step), ⚡ Fast 2x / ⚡ Fast 4x
@@ -172,7 +214,7 @@ Model install from an already-downloaded copy (no re-download):
 
 
 ==========================================================================
-9. TROUBLESHOOTING
+10. TROUBLESHOOTING
 ==========================================================================
 | Symptom                                  | Fix                                                     |
 |------------------------------------------|---------------------------------------------------------|

@@ -167,11 +167,64 @@ Head-to-head repeatability comparisons from the 11-prompt benchmarking suite (or
 
 ## Quick start
 
-From the repo root:
+### 1. Install
+
+From the repo root, create the two Python virtual environments (both are
+required — the main engine venv `venv/` and the isolated SDXL engine `venv-sdxl/`):
 
 ```bash
-./run.sh        # one command: backend (8001) + frontend (5174), opens the browser
+python3 -m venv venv
+python3 -m venv venv-sdxl
 ```
+
+Install the Python dependencies into each venv:
+
+```bash
+./venv/bin/python -m pip install -r backend/requirements.txt
+./venv-sdxl/bin/python -m pip install -r backend/requirements-sdxl.txt
+```
+
+Install the frontend dependencies, then launch everything with `run.sh`
+(backend on port **8001**, frontend on port **5174**, browser opens automatically):
+
+```bash
+cd frontend && npm install && cd ..
+./run.sh
+```
+
+> `run.sh` uses `./venv/bin/python -m uvicorn main:app` (never the stale
+> console-script shebangs) and keeps the Mac awake with `caffeinate` during
+> long renders. First generation downloads the model weights once (~2–3 GB
+> into the Hugging Face cache, allow ~20 min); afterwards it runs fully offline.
+
+### 2. Uninstall (full removal)
+
+Ensure your terminal is open inside the project folder you wish to remove:
+
+```bash
+cd /path/to/your/project-folder
+cd .. && rm -rf MLX-Diffusion
+```
+
+Purge the leftover caches so nothing lingers on the machine:
+
+```bash
+# purge pip cache (clears downloaded wheels and packages)
+python3 -m pip cache purge
+
+# clear npm global cache
+npm cache clean --force
+```
+
+### 3. Your first prompt
+
+Suggested starting prompt with **FLUX.2-klein 4B**, **Z-Image Turbo 6B** or
+**Krea 2 Turbo 13B** (4 steps for FLUX/Krea-distill, 8 steps for Z-Image):
+
+> A mischievous baby otter wearing a tiny yellow developer helmet, sitting in
+> front of a futuristic glowing computer setup. The glowing computer screen
+> clearly displays the words "HELLO WORLD" in vibrant neon text. Warm studio
+> lighting, shallow depth of field, 8k resolution, cinematic photorealism.
 
 Development mode (2 terminals):
 
