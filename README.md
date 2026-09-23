@@ -231,10 +231,9 @@ Suggested starting prompt with **FLUX.2-klein 4B**, **Z-Image Turbo 6B** or
 > reference tray first**, and **only FLUX.2-klein 4B accepts image input**.
 > On Z-Image, Krea 2 or SDXL the studio refuses the prompt with:
 >
-> `Cannot read "HELLOWORLD.png" (this model does not support image input)`
+<img width="512" height="768" alt="HELLOWORLD" src="https://github.com/user-attachments/assets/e0f899e0-3f8f-4edf-8211-aa7542c27c65" />
 >
-> If you get that error, either switch to a reference-capable model
-> (FLUX.2-klein 4B) or remove the `[Image N]` tag from the prompt.
+
 
 Development mode (2 terminals):
 
