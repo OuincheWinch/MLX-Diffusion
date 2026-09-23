@@ -30,6 +30,11 @@ Ports (do not change — 8000 / 5173 are reserved by other local tools):
 Full install + launch, from the project root (the folder containing run.sh,
 backend/ and frontend/):
 
+Step 0 - get the repo ( dow,load it for github )
+
+    git clone https://github.com/OuincheWinch/MLX-Diffusion.git
+    cd MLX-Diffusion
+
 Step 1 — create the two Python virtual environments (both are required:
 the main engine venv `venv/` and the isolated SDXL engine `venv-sdxl/`):
 
