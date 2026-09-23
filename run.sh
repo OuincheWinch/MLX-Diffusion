@@ -14,15 +14,18 @@ BACKEND_DIR="$PROJECT_DIR/backend"
 FRONTEND_DIR="$PROJECT_DIR/frontend"
 
 # Locate a usable Python venv (prefer repo venv, then venv-sdxl isn't one for the API).
+# NOTE: use venv/bin/python (not the venv/bin/uvicorn console script) — console-script
+# shebangs can point at a stale no-space venv path after a folder rename, silently
+# booting the whole app under the WRONG (old) python/mflux. Always launch via `-m`.
 VENV_PY=""
-for cand in "$PROJECT_DIR/venv/bin/uvicorn" "$PROJECT_DIR/backend/venv/bin/uvicorn"; do
+for cand in "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/backend/venv/bin/python"; do
     if [ -x "$cand" ]; then
         VENV_PY="$cand"
         break
     fi
 done
 if [ -z "$VENV_PY" ]; then
-    echo "❌ No venv found (looked for $PROJECT_DIR/venv/bin/uvicorn). Run setup first."
+    echo "❌ No venv found (looked for $PROJECT_DIR/venv/bin/python). Run setup first."
     exit 1
 fi
 
@@ -65,7 +68,7 @@ trap cleanup SIGINT SIGTERM EXIT
 # 2. Launch Backend
 echo "📦 Starting FastAPI backend on http://127.0.0.1:8001..."
 cd "$BACKEND_DIR"
-caffeinate -s "$VENV_PY" main:app --reload --port 8001 &
+caffeinate -s "$VENV_PY" -m uvicorn main:app --reload --port 8001 &
 BACKEND_PID=$!
 
 # Wait for backend to be ready

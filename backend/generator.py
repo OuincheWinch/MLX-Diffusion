@@ -4,6 +4,7 @@ import json
 import os
 import select
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -70,6 +71,14 @@ GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MODEL = "mlx-community/flux2-klein-4b-4bit"
 DEFAULT_MODEL_ID = "flux2-klein-4b"
+
+# Qwen-Image 2.1 sampler name -> mflux scheduler id. "linear" is mflux's native
+# default and renders saturated mono-color subjects correctly; the euler
+# empirical-mu scheduler collapses them to magenta/green.
+_QWEN_SCHEDULERS = {
+    "linear": "linear",
+    "euler": "flow_match_euler_discrete",
+}
 
 MODELS = {
     "flux2-klein-4b": {
@@ -296,12 +305,20 @@ MODELS = {
         "supports_loras": False,
         "supports_ref": True,  # single-image img2img (denoise strength)
         "supports_fast_vae": False,
+        # 2026-09-23: default sampler flipped to "linear". The forced
+        # flow_match_euler_discrete (empirical-mu) sampler catastrophically
+        # collapses saturated mono-color subjects to magenta/green (same seed &
+        # steps as the linear run, verified on a yellow-banana control: linear =
+        # clean, euler = 71% magenta) while linear renders them correctly; euler
+        # is still offered for scene/landscape looks where it was preferred.
+        "samplers": ["linear", "euler"],
+        "default_sampler": "linear",
         # Size caps removed 2026-09-22 (user decision). 16GB M1 note: the q4
         # pipeline is ~10.5GB resident; 1024² can OOM in the bf16 VAE decode.
         "presets": [
             {"id": "draft", "label": "⚡ Fast Draft (512×768, 25s)", "width": 512, "height": 768, "steps": 25},
-            {"id": "quality", "label": "✦ Quality (768×512, 40s euler)", "width": 768, "height": 512, "steps": 40},
-            {"id": "portrait", "label": "▮ Portrait (512×768, 40s euler)", "width": 512, "height": 768, "steps": 40},
+            {"id": "quality", "label": "✦ Quality (768×512, 40s)", "width": 768, "height": 512, "steps": 40},
+            {"id": "portrait", "label": "▮ Portrait (512×768, 40s)", "width": 512, "height": 768, "steps": 40},
         ],
     },
 }
@@ -1358,6 +1375,20 @@ def generate(
         scale = (cap_pixels / (width * height)) ** 0.5
         width = max(256, int(width * scale) // 16 * 16)
         height = max(256, int(height * scale) // 16 * 16)
+    if minfo["id"] == "qwen-image-2.1":
+        # Qwen-Image 2.1 runs in an isolated per-job subprocess. The long-lived
+        # API worker accumulates process-global state that silently corrupts the
+        # qwen denoise into magenta/pink output, while every fresh interpreter
+        # reproduces the identical seed/prompt/steps as clean content. Routing
+        # qwen to its own fresh process decouples it from that state entirely.
+        return _generate_qwen_subprocess(
+            prompt=prompt, width=width, height=height, steps=steps,
+            guidance=guidance, seed=seed, progress_cb=progress_cb,
+            phase_cb=phase_cb, model=model, cancel_event=cancel_event,
+            negative_prompt=negative_prompt, sampler=sampler,
+            ref_paths=ref_paths, image_strength=image_strength,
+            output_format=output_format, stealth=stealth, fast_vae=fast_vae,
+        )
     with _lock:
         _cancel_event.clear()
         _cancel_mflux_watchdog()
@@ -1500,6 +1531,7 @@ def generate(
                     "image_path": ref_paths[0] if ref_paths else None,
                     "image_strength": image_strength,
                 }
+                sampler_label = sampler or (minfo.get("default_sampler") or "euler_trailing")
                 if model == "qwen-image-2.1":
                     # true CFG on the Qwen-Image 2.1 port only engages when guidance > 1
                     # (noise = neg + g*(pos - neg)). Auto-raise guidance when a negative
@@ -1511,9 +1543,13 @@ def generate(
                         {
                             "negative_prompt": negative_prompt or None,
                             "guidance": eff_guidance,
-                            "scheduler": "flow_match_euler_discrete",  # validated recipe (linear is visibly worse)
+                            # default "linear" is mflux's native qwen21 scheduler and is the only one
+                            # verified to render saturated mono-color subjects cleanly; "euler" maps
+                            # to flow_match_euler_discrete (better for scenes, magenta on flat colors).
+                            "scheduler": _QWEN_SCHEDULERS.get((sampler or "linear").lower(), "linear"),
                         }
                     )
+                    sampler_label = (sampler or "linear").lower()
                 out = pipe.generate_image(**gen_kwargs)
             infer_time = round(time.time() - t_infer_start, 2)
         finally:
@@ -1553,8 +1589,8 @@ def generate(
         meta = {
             "id": image_id,
             "prompt": prompt,
-            "negative_prompt": negative_prompt or "",
-            "sampler": sampler or "Euler",
+"negative_prompt": negative_prompt or "",
+                    "sampler": sampler_label,
             "width": width,
             "height": height,
             "steps": steps,
@@ -2021,4 +2057,168 @@ def _generate_sdxl(prompt, width, height, steps, guidance, seed, loras,
             return meta
         finally:
             _arm_sdxl_watchdog()
+
+
+_qwen_stderr_tail = collections.deque(maxlen=100)
+
+
+def _drain_qwen_stderr(proc):
+    try:
+        for line in iter(proc.stderr.readline, ""):
+            _qwen_stderr_tail.append(line)
+    except Exception:
+        pass
+
+
+def _generate_qwen_subprocess(prompt, width, height, steps, guidance, seed,
+                              progress_cb=None, phase_cb=None, model="qwen-image-2.1",
+                              cancel_event=None, negative_prompt="", sampler=None,
+                              ref_paths=None, image_strength=None,
+                              output_format="png", stealth=False, fast_vae=True):
+    """Qwen-Image 2.1 via a fresh per-job interpreter (see qwen_engine.py).
+
+    The API worker's process-global state corrupts qwen denoising (pink/magenta);
+    a brand-new interpreter is provably clean. Load is ~3s warm, so a per-job
+    subprocess costs little. Lock + pipeline drop guarantee exclusive residency."
+    """
+    with _lock:
+        _cancel_mflux_watchdog()
+        try:
+            _drop_mflux_pipeline()
+            minfo = get_model_info(model) or {}
+            seed = seed if seed is not None else int(time.time())
+            t0 = time.time()
+            image_id = uuid.uuid4().hex
+            fmt = "jpeg" if str(output_format).lower() in ("jpeg", "jpg") else "png"
+            raw_image_path = GENERATED_DIR / f"{image_id}.raw.png"
+            final_image_path = GENERATED_DIR / f"{image_id}.{fmt}"
+            sampler_label = (sampler or (minfo.get("default_sampler") or "linear")).lower()
+            req = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt or "",
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "guidance": guidance if guidance is not None else (minfo.get("default_guidance") or 1.0),
+                "seed": seed,
+                "sampler": sampler_label,
+                "dest": str(raw_image_path),
+                "ref_paths": [str(Path(p).resolve()) for p in (ref_paths or [])],
+                "image_strength": image_strength,
+                "fast_vae": bool(fast_vae),
+                "phase_cb": phase_cb is not None,
+            }
+            if phase_cb is not None:
+                phase_cb("preparing", "Preparing prompt & Qwen-Image 2.1 subprocess...")
+            _cancel_event.clear()
+            engine = Path(__file__).parent / "qwen_engine.py"
+            _qwen_stderr_tail.clear()
+            # Launch the engine with the REPO venv's python, not sys.executable: the
+            # venv/bin/* console-script shebangs can point at a stale venv path (an old
+            # rename), which silently swaps in an older mflux whose text-encoder weight
+            # mapping lacks the community-layout prefix fix -> random-init TE -> pink.
+            _repo_python = Path(__file__).resolve().parent.parent / "venv" / "bin" / "python"
+            _python_exe = str(_repo_python) if _repo_python.exists() else sys.executable
+            proc = subprocess.Popen(
+                [_python_exe, str(engine), json.dumps(req)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1, cwd=str(Path(__file__).resolve().parent),
+            )
+            threading.Thread(target=_drain_qwen_stderr, args=(proc,), daemon=True).start()
+            result = None
+            while True:
+                if (cancel_event is not None and cancel_event.is_set()) or _cancel_event.is_set():
+                    proc.kill()
+                    raise GenerationCancelled()
+                r, _, _ = select.select([proc.stdout], [], [], 0.2)
+                if not r:
+                    if proc.poll() is not None:
+                        if result is None:
+                            err = "".join(_qwen_stderr_tail)[-2000:] or "process exited unexpectedly"
+                            raise RuntimeError(f"Qwen engine died: {err}")
+                        break
+                    continue
+                line = proc.stdout.readline()
+                if not line:
+                    if result is None:
+                        err = "".join(_qwen_stderr_tail)[-2000:] or "EOF on stdout"
+                        raise RuntimeError(f"Qwen engine died: {err}")
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    if "progress" in payload and progress_cb is not None:
+                        progress_cb(payload["progress"]["step"] - 1)
+                    elif "phase" in payload and phase_cb is not None:
+                        phase_cb(payload["phase"], payload.get("detail", ""))
+                    elif "diag" in payload:
+                        print(f"[qwen-engine diag] {json.dumps(payload)}", flush=True)
+                    elif "error" in payload:
+                        result = payload
+                    else:
+                        result = payload
+            if result is None:
+                err = "".join(_qwen_stderr_tail)[-2000:] or "no result received"
+                raise RuntimeError(f"Qwen engine returned no result: {err}")
+            if "error" in result:
+                raise RuntimeError(result["error"])
+            if phase_cb is not None:
+                phase_cb("saving", "Finalizing image and metadata...")
+            elapsed = result["generation_time"]
+            meta = {
+                "id": image_id,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt or "",
+                "sampler": result.get("sampler") or sampler_label,
+                "width": width,
+                "height": height,
+                "steps": result.get("steps", steps),
+                "guidance": guidance if guidance is not None else (minfo.get("default_guidance") or 1.0),
+                "seed": seed,
+                "quantization": 4,
+                "loras": [],
+                "generation_time": elapsed,
+                "load_time": result.get("load_time", 0.0),
+                "created_at": time.time(),
+                "software": "MLX-DIFFUSION",
+                "generator": "MLX-DIFFUSION",
+                "artist": app_settings.metadata_artist(),
+                "tags": [],
+                "file": final_image_path.name,
+                "model": minfo["repo"],
+                "reference_images": [Path(p).name for p in (ref_paths or [])],
+                "stealth": stealth,
+                "format": fmt,
+                "fast_vae": bool(fast_vae),
+            }
+            if minfo.get("civitai_version_id"):
+                meta["modelVersionId"] = minfo["civitai_version_id"]
+            if minfo.get("civitai_model_id"):
+                meta["modelId"] = minfo["civitai_model_id"]
+            if minfo.get("civitai_model_name"):
+                meta["model_label"] = minfo["civitai_model_name"]
+            if minfo.get("civitai_version_name"):
+                meta["modelVersionName"] = minfo["civitai_version_name"]
+            img = Image.open(raw_image_path)
+            save_image_with_metadata(
+                image=img,
+                dest_path=final_image_path,
+                meta=meta,
+                output_format=fmt,
+                stealth=stealth,
+            )
+            try:
+                raw_image_path.unlink()
+            except OSError:
+                pass
+            (GENERATED_DIR / f"{image_id}.json").write_text(json.dumps(meta, indent=2))
+            gc.collect()
+            return meta
+        finally:
+            _arm_mflux_watchdog()
 

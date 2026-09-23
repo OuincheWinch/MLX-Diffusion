@@ -61,8 +61,9 @@ No account is required to generate — everything runs offline. **Two optional t
 | **Juggernaut XL Lightning** (SDXL, distilled) | 4-bit | 4 steps, `euler_trailing` | ~15–20 s @ 1024×1024 (with TAESD) |
 | **Krea 2 Turbo 13B** | 4-bit | 8 steps native · 4 steps with the distill LoRA | ~140 s (4-step) · ~250 s (8-step) @ 512×512 |
 | **Z-Image Turbo 6B** | 4-bit | fast sketches, 16:9 | ~40 s @ 1024×1024 |
+| **Qwen-Image 2.1** (7B) | 4-bit | 20 steps, guidance 1.0 (negative prompts auto-raise it to 3.0) | ~458 s @ 512×768 (20-step arena) |
 
-All four are quantized and memory-tuned for 16 GB unified memory — switching engines swaps weights on demand instead of keeping everything resident.
+All five are quantized and memory-tuned for 16 GB unified memory — switching engines swaps weights on demand instead of keeping everything resident.
 
 ---
 
@@ -97,6 +98,7 @@ Measured on the **2021 MacBook Pro M1 (16 GB)**, from the last 2 days of studio 
 | **Z-Image Turbo 6B** | 512×512 | 8 | 46/52 | 1:42 min | 1:43 min | 1:15 – 2:13 min |
 | **Z-Image Turbo 6B** | 512×768 | 8 | 16/18 | 2:22 min | 2:22 min | 1:57 – 2:43 min |
 | **Z-Image Turbo 6B** | 768×768 | 8 | 3/5 | 3:49 min | 3:44 min | 3:44 – 3:59 min |
+| **Qwen-Image 2.1** | 512×768 | 20 | 10/10 | 7:38 min | 7:36 min | 7:10 – 8:05 min |
 
 `n (trim)` = samples kept after removing the fastest/slowest 5% out of the raw count.  `*` 4-step Krea runs use the Krea 2 distilled 4-step LoRA. `—` = single-sample bucket.
 
@@ -110,7 +112,7 @@ Measured on the **2021 MacBook Pro M1 (16 GB)**, from the last 2 days of studio 
 | Juggernaut XL Lightning (SDXL) | 1024×1024 | 1 | 1:07 min | 1:07 min |
 | Krea 2 Turbo 13B | 1024×1024 | 2 | 12:16 min | 12:16 min |
 
-**Read the numbers like this:** Juggernaut XL Lightning at 512×768 is by far the fastest combo (median 9 s — its distilled 4-step + TAESD decode), Z-Image Turbo costs ~10× more at the same size, and FLUX.2-klein sits in between with the most resolution flexibility. The wide trimmed ranges on `512×768` buckets (Krea, Z-Image, Juggernaut 832×1216) are exactly the load spikes this methodology filters — treat medians, not means, as the stable number.
+**Read the numbers like this:** Juggernaut XL Lightning at 512×768 is by far the fastest combo (median 9 s — its distilled 4-step + TAESD decode), Z-Image Turbo costs ~10× more at the same size, and FLUX.2-klein sits in between with the most resolution flexibility. The wide trimmed ranges on `512×768` buckets (Krea, Z-Image, Juggernaut 832×1216) are exactly the load spikes this methodology filters — treat medians, not means, as the stable number. Qwen-Image 2.1's row is from a dedicated controlled sweep (10 scenes, seeds 1001–1010, 20-step linear, guidance 1.0) that also confirmed its 64-channel RGBA VAE handles 512×768 on the 16 GB M1 without OOM.
 
 ---
 
@@ -189,7 +191,7 @@ Ports are fixed — **8001** and **5174** (8000 and 5173 belong to other local t
 
 - **Backend** — Python / FastAPI, worker thread + FIFO queue, MLX inference via `mflux` and a native MLX SDXL daemon
 - **Frontend** — React 19 + Vite
-- **Engines** — FLUX.2-klein 4B, Juggernaut XL Lightning (SDXL), Krea 2 Turbo, Z-Image Turbo
+- **Engines** — FLUX.2-klein 4B, Juggernaut XL Lightning (SDXL), Krea 2 Turbo, Z-Image Turbo, Qwen-Image 2.1
 - **Cleanup** — idle watchdogs release the ~10 GB resident pipeline 5 min after the last generation
 
 ---

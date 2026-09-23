@@ -56,6 +56,7 @@ tasks/
 backend/tests/
 
 # ---- Personal docs (kept local only) ----
+PLAN_ACCEL_QWEN.MD
 AGENTS.md
 ARCHITECTURE.md
 ARCHITECTURE_FR.md
