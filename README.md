@@ -1,4 +1,4 @@
-# MLX-DIFFUSION
+# MLX-Diffusion
 
 ![MLX-DIFFUSION on MacBook Pro](frontend/src/assets/MLX-DIFFUSION_ON_MBP.png)
 
