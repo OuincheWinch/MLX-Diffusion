@@ -30,7 +30,7 @@ Ports (do not change — 8000 / 5173 are reserved by other local tools):
 Full install + launch, from the project root (the folder containing run.sh,
 backend/ and frontend/):
 
-Step 0 - get the repo ( dow,load it for github )
+Step 0 - get the repo ( download it fron github )
 
     git clone https://github.com/OuincheWinch/MLX-Diffusion.git
     cd MLX-Diffusion
