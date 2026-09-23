@@ -224,7 +224,17 @@ Suggested starting prompt with **FLUX.2-klein 4B**, **Z-Image Turbo 6B** or
 > A mischievous baby otter wearing a tiny yellow developer helmet, sitting in
 > front of a futuristic glowing computer setup. The glowing computer screen
 > clearly displays the words "HELLO WORLD" in vibrant neon text. Warm studio
-> lighting, shallow depth of field, 8k resolution, cinematic photorealism.
+> lighting, shallow depth of field, 8k resolution, cinematic photorealism. [Image 1]
+
+> **In-context reference (`[Image 1]`)** — the tag at the end conditions the
+> generation on a reference image, but you must **load that image into the
+> reference tray first**, and **only FLUX.2-klein 4B accepts image input**.
+> On Z-Image, Krea 2 or SDXL the studio refuses the prompt with:
+>
+> `Cannot read "HELLOWORLD.png" (this model does not support image input)`
+>
+> If you get that error, either switch to a reference-capable model
+> (FLUX.2-klein 4B) or remove the `[Image N]` tag from the prompt.
 
 Development mode (2 terminals):
 

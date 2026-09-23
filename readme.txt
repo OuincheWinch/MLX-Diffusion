@@ -69,6 +69,13 @@ Krea 2 Turbo 13B):
      Warm studio lighting, shallow depth of field, 8k resolution, cinematic
      photorealism."
 
+In-context reference tip: appending [Image 1] to the prompt conditions the
+generation on a reference image. You MUST load that image into the reference
+tray first, and ONLY FLUX.2-klein 4B accepts image input — Z-Image, Krea 2
+and SDXL refuse it with:
+    Cannot read "HELLOWORLD.png" (this model does not support image input)
+If you see that error, switch to FLUX.2-klein 4B or remove the [Image N] tag.
+
 
 ==========================================================================
 3. DEVELOPMENT MODE (2 TERMINALS)
