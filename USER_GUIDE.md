@@ -164,7 +164,7 @@ All generated images embed full generation metadata into standard PNG `tEXt` chu
 - Prompt, Negative prompt, Steps, Sampler, Seed, Guidance/CFG scale.
 - Checkpoint name and canonical AutoV2 hashes.
 - LoRAs list with exact version IDs and hashes.
-- Generator / Software: `"MLX-DIFFUSION"`, Artist: `"www.ouinche.com"`.
+- Generator / Software: `"MLX-Diffusion"`, Artist: `"www.ouinche.com"`.
 - 100% compatible with Civitai upload drag-and-drop parsing.
 
 ---
@@ -195,11 +195,11 @@ All generated images embed full generation metadata into standard PNG `tEXt` chu
 
 ## 7. Useful Shell Aliases (Configured in `~/.zshrc`)
 
-To manage MLX-DIFFUSION effortlessly from any terminal:
+To manage MLX-Diffusion effortlessly from any terminal:
 
 ```bash
 # 🚀 1-command launch: frees ports, starts backend & frontend, opens browser, traps Ctrl+C
-alias run-mlx='/Volumes/Externe/IA/MLX-DIFFUSION/run.sh'
+alias run-mlx='/YOUR/PATH/TO/MLX-DIFFUSION/run.sh'
 
 # 🛑 Kill all MLX-DIFFUSION processes (backend, SDXL engine, Vite, caffeinate)
 alias kill-mlx='pkill -f "uvicorn main:app" ; pkill -f sdxl_engine.py ; pkill -f "vite" ; pkill -f "caffeinate.*uvicorn"'
