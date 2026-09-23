@@ -118,7 +118,8 @@ Measured on the **2021 MacBook Pro M1 (16 GB)**, from the last 2 days of studio 
 
 ## Model vs model — visual arena
 
-Head-to-head repeatability comparisons from the 11-prompt benchmarking suite (original, royalty-free scenes — a sourdough loaf, a cliff villa, a snow leopard; **no copyrighted characters**). Each duel plays *live right here in the README* as a muted auto-wiping divider video — the same sweep the interactive arena does, no scripts needed (GitHub strips JavaScript from READMEs, so a draggable slider can't render on the repo page; the moving divider below is the closest that does). For the **draggable** version, open [`docs/model-arena/index.html`](docs/model-arena/index.html) in a browser.
+Head-to-head repeatability comparisons from the 11-prompt benchmarking suite (original, royalty-free scenes — a sourdough loaf, a cliff villa, a snow leopard; **no copyrighted characters**). Each duel plays *live right here in the README* as a muted auto-wiping divider video — the same sweep the interactive arena does, no scripts needed (GitHub strips JavaScript from READMEs, so a draggable slider can't render on the repo page; the moving divider below is the closest that does). For the **draggable** version, open [`https://www.ouinche.com/mlx-diffusion-yet-another-open-source-image-generator-on-apple-silicon/`](https://www.ouinche.com/mlx-diffusion-yet-another-open-source-image-generator-on-apple-silicon/) in a browser.
+ in a browser.
 
 ### FLUX.2-klein 4B vs Z-Image Turbo 6B — "Rustic Sourdough" (512×768)
 
@@ -150,7 +151,7 @@ Head-to-head repeatability comparisons from the 11-prompt benchmarking suite (or
 |---|---|
 | ![FLUX.2-klein 4B, Snow Leopard](docs/model-arena/images/flux2_klein_leopard.png) | ![Krea 2 Turbo 13B, Snow Leopard](docs/model-arena/images/krea_leopard.png) |
 
-> Wipe doesn't play? Some clients block autoplay — hit the ▶ control, or use the static tables above. For the full interactive arena: open [`docs/model-arena/index.html`](docs/model-arena/index.html) in a browser.
+> For the full interactive arena: open [`https://www.ouinche.com/mlx-diffusion-yet-another-open-source-image-generator-on-apple-silicon/`](https://www.ouinche.com/mlx-diffusion-yet-another-open-source-image-generator-on-apple-silicon/) in a browser.
 
 ---
 
