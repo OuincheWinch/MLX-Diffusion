@@ -167,12 +167,19 @@ Head-to-head repeatability comparisons from the 11-prompt benchmarking suite (or
 
 ## Quick start
 
+### 0. Download
+
+```bash
+git clone https://github.com/OuincheWinch/MLX-Diffusion.git
+```
+
 ### 1. Install
 
 From the repo root, create the two Python virtual environments (both are
 required — the main engine venv `venv/` and the isolated SDXL engine `venv-sdxl/`):
 
 ```bash
+cd MLX-Diffusion
 python3 -m venv venv
 python3 -m venv venv-sdxl
 ```
@@ -184,37 +191,28 @@ Install the Python dependencies into each venv:
 ./venv-sdxl/bin/python -m pip install -r backend/requirements-sdxl.txt
 ```
 
-Install the frontend dependencies, then launch everything with `run.sh`
+Install the frontend dependencies,
 (backend on port **8001**, frontend on port **5174**, browser opens automatically):
 
 ```bash
 cd frontend && npm install && cd ..
+```
+
+### 2. Run
+
+Launch MLX-Diffusion
+
+```bash
 ./run.sh
 ```
+Type CTRL+C in your terminal to close MLX-Diffusion
 
 > `run.sh` uses `./venv/bin/python -m uvicorn main:app` (never the stale
 > console-script shebangs) and keeps the Mac awake with `caffeinate` during
 > long renders. First generation downloads the model weights once (~2–3 GB
 > into the Hugging Face cache, allow ~20 min); afterwards it runs fully offline.
 
-### 2. Uninstall (full removal)
 
-Ensure your terminal is open inside the project folder you wish to remove:
-
-```bash
-cd /path/to/your/project-folder
-cd .. && rm -rf MLX-Diffusion
-```
-
-Purge the leftover caches so nothing lingers on the machine:
-
-```bash
-# purge pip cache (clears downloaded wheels and packages)
-python3 -m pip cache purge
-
-# clear npm global cache
-npm cache clean --force
-```
 
 ### 3. Your first prompt
 
@@ -234,6 +232,26 @@ Suggested starting prompt with **FLUX.2-klein 4B**, **Z-Image Turbo 6B** or
 <img width="512" height="768" alt="HELLOWORLD" src="https://github.com/user-attachments/assets/e0f899e0-3f8f-4edf-8211-aa7542c27c65" />
 >
 
+### 3. Uninstall (full removal) when needed
+
+Ensure your terminal is open inside the project folder you wish to remove:
+
+( Check path twice ! ) 
+
+```bash
+cd /path/to/your/MLX-Diffusion
+cd .. && rm -rf MLX-Diffusion
+```
+
+Purge the leftover caches so nothing lingers on the machine:
+
+```bash
+# purge pip cache (clears downloaded wheels and packages)
+python3 -m pip cache purge
+
+# clear npm global cache
+npm cache clean --force
+```
 
 Development mode (2 terminals):
 
