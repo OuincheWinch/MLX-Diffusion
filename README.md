@@ -252,6 +252,8 @@ python3 -m pip cache purge
 # clear npm global cache
 npm cache clean --force
 ```
+---
+
 
 Development mode (2 terminals):
 
