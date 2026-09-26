@@ -26,9 +26,11 @@ function GenerationParams({
   setSampler,
   cacheInterval,
   setCacheInterval,
-  supportsRef,
-  supportsMultiRef,
-  refImages,
+   supportsRef,
+   supportsMultiRef,
+   maxReferenceImages = 1,
+   refImages,
+
   refStrength,
   setRefStrength,
   pickRefImages,
@@ -37,16 +39,17 @@ function GenerationParams({
   maxPixels,
   setMaxPixels,
 }) {
-  const maxRefImages = supportsMultiRef ? 10 : 1;
-  const haveHardCap = Boolean(maxPixels && modelInfo.max_pixels);
-  // Filter the size dropdown to resolutions that fit the editable hard cap (win/win:
-  // protects the VAE decode budget while still letting users loosen the cap).
-  const cappedSizes = haveHardCap
-    ? STANDARD_SIZES.filter((s) => {
-        const [w, h] = s.value.split("x").map(Number);
-        return w * h <= Number(maxPixels);
-      })
-    : STANDARD_SIZES;
+   const maxRefImages = Math.max(1, Number(maxReferenceImages) || 1);
+
+   const haveHardCap = Boolean(maxPixels && modelInfo.max_pixels);
+   // Filter the size dropdown to resolutions that fit the editable hard cap (win/win:
+   // protects the VAE decode budget while still letting users loosen the cap).
+   const cappedSizes = haveHardCap
+     ? STANDARD_SIZES.filter((s) => {
+         const [w, h] = s.value.split("x").map(Number);
+         return w * h <= Number(maxPixels);
+       })
+     : STANDARD_SIZES;
 
   function randomizeSeed() {
     setSeed("");
@@ -105,7 +108,8 @@ function GenerationParams({
               Max pixels (hard cap)
               <span
                 className="distill-subtle-tag"
-                title="Hard ceiling enforced by the backend. Lower it to protect Apple Silicon memory (Qwen's bf16 VAE decode OOMs past ~512×768 on 16GB)."
+                 title="Hard ceiling enforced by the backend for this model."
+
               >
                 ⚙ OOM guard
               </span>
@@ -264,7 +268,14 @@ function GenerationParams({
             {refImages.map((img, idx) => (
               <div className="ref-card" key={img.id || img.path}>
                 <div className="ref-thumb-wrapper">
-                  <img src={img.preview} alt={`Reference ${idx + 1}`} />
+                   {img.preview ? (
+                     <img src={img.preview} alt={`Reference ${idx + 1}`} />
+                   ) : (
+                     <span className="ref-preview-missing" aria-label={`Reference ${idx + 1} preview unavailable`}>
+                       {idx + 1}
+                     </span>
+                   )}
+
                   <span className="ref-index-badge">Image {idx + 1}</span>
                   <button
                     type="button"

@@ -1,2 +1,17 @@
 #!/bin/zsh
-cd "$(dirname "$0")/backend" && caffeinate -s ../venv/bin/uvicorn main:app --reload --port 8001
+set -euo pipefail
+
+PROJECT_DIR="${0:A:h}"
+VENV_PY=""
+for candidate in "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/backend/venv/bin/python"; do
+    if [[ -x "$candidate" ]]; then
+        VENV_PY="$candidate"
+        break
+    fi
+done
+if [[ -z "$VENV_PY" ]]; then
+    print -u2 "No backend venv found. Run setup first."
+    exit 1
+fi
+cd "$PROJECT_DIR/backend"
+exec caffeinate -s "$VENV_PY" -m uvicorn main:app --reload --port 8001

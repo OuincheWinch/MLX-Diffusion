@@ -184,7 +184,7 @@ export default function EngineSection() {
               : "No pipeline resident (cold reload on next generation)"}
           </p>
           <div className="engine-chips">
-            {gauge("Idle policy", `${mflux.idle_kill_s || 300}s`)}
+            {gauge("Idle policy", `${mflux.idle_kill_s ?? 300}s`)}
             {gauge("Prompt cache", String(mflux.prompt_cache_size ?? 0))}
             {gauge("Watchdog", mflux.watchdog_armed ? "armed" : "cold")}
           </div>
@@ -208,7 +208,7 @@ export default function EngineSection() {
               : "Daemon not running (spawned lazily)"}
           </p>
           <div className="engine-chips">
-            {gauge("Idle policy", `${sdxl.idle_kill_s || 300}s`)}
+            {gauge("Idle policy", `${sdxl.idle_kill_s ?? 300}s`)}
             {gauge("Watchdog", sdxl.watchdog_armed ? "armed" : "cold")}
           </div>
           {sdxl.stderr_tail && (

@@ -30,7 +30,6 @@ Guarantees 100% preservation and natural integration of active LoRA trigger word
 """
 
 import json
-import os
 import re
 import sys
 import threading
@@ -47,15 +46,15 @@ class EnhancementCancelled(Exception):
 
 _model = None
 _tokenizer = None
+_model_lock = threading.Lock()
 _lora_registry_cache: Optional[List[Dict[str, Any]]] = None
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
-LOCAL_MODEL_DIR = DATA_DIR / "models" / "qwen2.5-0.5b-instruct-4bit"
+DATA_DIR = app_settings.DATA_DIR
+ASSET_DIR = app_settings.ASSET_DIR
+LOCAL_MODEL_DIR = ASSET_DIR / "models" / "qwen2.5-0.5b-instruct-4bit"
 
 if LOCAL_MODEL_DIR.exists():
     DEFAULT_MODEL_REPO = str(LOCAL_MODEL_DIR)
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 else:
     DEFAULT_MODEL_REPO = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 
@@ -170,6 +169,20 @@ ENGINE_PROFILES = {
             "for consistency."
         ),
     },
+    "qwen": {
+        "label": "Qwen-Image 2.1 (Qwen3-VL)",
+        "length": "70 to 150 words",
+        "max_words": 150,
+        "instructions": (
+            "Target Engine: Qwen-Image 2.1 (Qwen3-VL text encoder; experimental MLX port).\n"
+            "Write 70-150 words of concrete, scene-first visual prose. State the subject, action, environment, "
+            "composition, camera, lighting, materials, and important text before adding atmosphere.\n"
+            "Keep relationships and spatial placement explicit. Use exact quoted text and color hex values when "
+            "they matter. Prefer positive visual descriptions; only use a negative clause when the requested "
+            "avoidance is essential. Preserve LoRA trigger phrases verbatim.\n"
+            "Do not add unsupported camera brands, resolutions, or quality buzzwords."
+        ),
+    },
 }
 
 
@@ -244,10 +257,12 @@ def _get_model(cancel_event: Optional[threading.Event] = None):
     if cancel_event is not None and cancel_event.is_set():
         raise EnhancementCancelled()
     if _model is None:
-        from mlx_lm import load
-        print(f"[prompt_enhancer] loading model {DEFAULT_MODEL_REPO}...", file=sys.stderr)
-        _model, _tokenizer = load(DEFAULT_MODEL_REPO)
-        print("[prompt_enhancer] model loaded.", file=sys.stderr)
+        with _model_lock:
+            if _model is None:
+                from mlx_lm import load
+                print(f"[prompt_enhancer] loading model {DEFAULT_MODEL_REPO}...", file=sys.stderr)
+                _model, _tokenizer = load(DEFAULT_MODEL_REPO)
+                print("[prompt_enhancer] model loaded.", file=sys.stderr)
     if cancel_event is not None and cancel_event.is_set():
         raise EnhancementCancelled()
     return _model, _tokenizer
@@ -274,6 +289,8 @@ def _normalize_engine(engine: str) -> str:
         engine_key = "krea2"
     elif "z-image" in engine_lower or "zit" in engine_lower:
         engine_key = "z-image-turbo"
+    elif "qwen" in engine_lower:
+        engine_key = "qwen"
     return engine_key
 
 

@@ -6,6 +6,8 @@ backend/data/hf_token.txt
 backend/data/*.token
 backend/data/*token*.txt
 **/hf_token.txt
+session.txt
+
 
 # ---- Python ----
 __pycache__/

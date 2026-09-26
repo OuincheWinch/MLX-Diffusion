@@ -23,10 +23,14 @@ LoRA key mapping (kohya/ComfyUI -> diffusers names used by mlx-diffuser):
 """
 import gc
 import json
+import math
+import os
 import re
 import struct
 import sys
 import threading
+
+from contextlib import contextmanager
 from pathlib import Path
 
 # Ensure backend directory is in sys.path for local imports like taesd_mlx
@@ -35,7 +39,6 @@ if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 
 _ipc_stdout_lock = threading.Lock()
@@ -85,19 +88,21 @@ try:
     def _safe_decode(
         self, z: mx.array, *, tile: bool = False, tile_latent: int = 64, overlap_latent: int = 16
     ) -> mx.array:
-        # Clear residual UNet activation graph and unpin wired memory before VAE decode
-        try:
-            import gc
-            import mlx.core as _mx
-            _mx.set_wired_limit(0)
-            _mx.metal.clear_cache()
-            _mx.clear_cache()
-            gc.collect()
-        except Exception:
-            pass
+        fast_vae = bool(getattr(self, "use_taesd", False))
+        clear_mode = os.environ.get("MLX_SDXL_VAE_CLEAR", "full-only")
+        if clear_mode == "always" or (clear_mode == "full-only" and not fast_vae):
+            try:
+                import gc
+                import mlx.core as _mx
+                _mx.set_wired_limit(0)
+                _mx.metal.clear_cache()
+                _mx.clear_cache()
+                gc.collect()
+            except Exception:
+                pass
 
         # Option B: Ultra-fast TAESD decode (~0.5s)
-        if getattr(self, "use_taesd", False):
+        if fast_vae:
             try:
                 from taesd_mlx import get_taesd_decoder
                 c_taesd = get_taesd_decoder()
@@ -119,7 +124,10 @@ try:
             self._compiled_decoder = decoder
 
         if tile:
-            return self._tiled(z, max(tile_latent, 64), overlap_latent)
+            latent_size = max(z.shape[1], z.shape[2])
+            effective_tile = 96 if latent_size > 128 else max(tile_latent, 64)
+            effective_overlap = min(max(0, overlap_latent), max(0, effective_tile // 4))
+            return self._tiled(z, effective_tile, effective_overlap)
         return decoder(z)
 
     AutoencoderKLSD.decode = _safe_decode
@@ -160,12 +168,22 @@ try:
 except Exception as _e:
     print(f"[sdxl] WARN failed to patch schedulers: {_e}", file=sys.stderr)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "backend" / "data"
-DEFAULT_MODEL_DIR = DATA_DIR / "models" / "juggernaut-xl-lightning"
+_configured_asset_dir = os.environ.get("MLX_DIFFUSION_ASSET_DIR", "").strip()
+if _configured_asset_dir:
+    _asset_dir = Path(_configured_asset_dir).expanduser()
+    if not _asset_dir.is_absolute():
+        raise ValueError("MLX_DIFFUSION_ASSET_DIR must be an absolute path")
+    ASSET_DIR = _asset_dir.resolve()
+else:
+    ASSET_DIR = Path(__file__).resolve().parent.parent / "backend" / "data"
+DATA_DIR = ASSET_DIR
+DEFAULT_MODEL_DIR = ASSET_DIR / "models" / "juggernaut-xl-lightning"
+_MAX_PROMPT_BYTES = 128 * (1 << 10)
 
 _pipeline = None            # resident pipeline
 _pipeline_model_dir = None  # path to model directory it was loaded from
 _pipeline_quant = None      # quantization level it was loaded with
+_pipeline_load_time = 0.0
 _lora_state = None  # tuple of (path, scale) currently applied
 
 
@@ -173,6 +191,33 @@ from collections import OrderedDict
 
 _prompt_cache: OrderedDict[str, tuple] = OrderedDict()
 _PROMPT_CACHE_MAX_SIZE = 64
+_PROMPT_CACHE_MAX_BYTES = 128 * (1 << 20)
+
+
+def _value_bytes(value) -> int:
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+    if isinstance(value, dict):
+        return sum(_value_bytes(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_value_bytes(v) for v in value)
+    return 0
+
+
+def _trim_prompt_cache():
+    total = sum(_value_bytes(v) for v in _prompt_cache.values())
+    while _prompt_cache and (
+        len(_prompt_cache) > _PROMPT_CACHE_MAX_SIZE or total > _PROMPT_CACHE_MAX_BYTES
+    ):
+        _, value = _prompt_cache.popitem(last=False)
+        total -= _value_bytes(value)
+
+
+def _cache_prompt(key, value):
+    _prompt_cache[key] = value
+    _prompt_cache.move_to_end(key)
+    _trim_prompt_cache()
 
 
 def _patch_encode_prompt(pipe):
@@ -188,72 +233,87 @@ def _patch_encode_prompt(pipe):
             return _prompt_cache[key]
         pe, pooled = orig_encode(prompt)
         mx.eval(pe, pooled)
-        _prompt_cache[key] = (pe, pooled)
-        if len(_prompt_cache) > _PROMPT_CACHE_MAX_SIZE:
-            _prompt_cache.popitem(last=False)
+        _cache_prompt(key, (pe, pooled))
         return pe, pooled
 
     pipe.encode_prompt = cached_encode
 
 
 def get_pipeline(model_dir: str | Path | None = None, quantize_unet: int | None = 4):
-    global _pipeline, _pipeline_model_dir, _pipeline_quant
+    global _pipeline, _pipeline_model_dir, _pipeline_quant, _pipeline_load_time
     target_dir = Path(model_dir).resolve() if model_dir else DEFAULT_MODEL_DIR.resolve()
     target_quant = quantize_unet or None
     if _pipeline is None or _pipeline_model_dir != target_dir or _pipeline_quant != target_quant:
+        import time
+
         from mlx_diffuser import StableDiffusionXLPipeline
 
         _reset_pipeline()
+        load_started = time.monotonic()
         _write_ipc_json({"phase": "loading_model", "detail": "Loading SDXL UNet & text encoders into unified memory..."})
         print(f"[sdxl] loading pipeline from {target_dir} (quant_unet={target_quant})...", file=sys.stderr, flush=True)
-        # 4-bit UNet is ~5x FASTER than fp16 on M1 (fused quant matmul) and
-        # halves memory; 8-bit is pathologically slow (dequant per matmul).
         _pipeline = StableDiffusionXLPipeline.from_diffusers(
             str(target_dir), quantize_unet=target_quant)
         _patch_encode_prompt(_pipeline)
         _pipeline_model_dir = target_dir
         _pipeline_quant = target_quant
-        print(f"[sdxl] pipeline loaded successfully from {target_dir.name}", file=sys.stderr, flush=True)
+        _pipeline_load_time = round(time.monotonic() - load_started, 2)
+        print(f"[sdxl] pipeline loaded successfully from {target_dir.name} in {_pipeline_load_time:.2f}s", file=sys.stderr, flush=True)
+    else:
+        _pipeline_load_time = 0.0
     return _pipeline
 
 
-_applied_lora_hooks = []  # list of (comp, parent, last_key, original_linear)
+_applied_lora_hooks = []
+
+
+def _replace_module(parent, last, value):
+    if isinstance(parent, list):
+        parent[int(last)] = value
+    else:
+        setattr(parent, last, value)
+
+
+def _restore_lora_hooks(hooks):
+    had_te = any(h[0] in ("text_encoder", "text_encoder_2") for h in hooks)
+    for comp, parent, last, linear in reversed(hooks):
+        try:
+            _replace_module(parent, last, linear)
+        except Exception:
+            pass
+    if had_te:
+        _prompt_cache.clear()
 
 
 def _unload_loras():
-    global _applied_lora_hooks, _lora_state
-    had_te = any(h[0] in ("text_encoder", "text_encoder_2") for h in _applied_lora_hooks)
-    if had_te:
-        _prompt_cache.clear()
-    for comp, parent, last, linear in _applied_lora_hooks:
-        try:
-            if isinstance(parent, list) or (isinstance(last, str) and last.isdigit() and isinstance(parent, list)):
-                parent[int(last)] = linear
-            else:
-                setattr(parent, last, linear)
-        except Exception:
-            pass
+    global _lora_state
+    hooks = list(_applied_lora_hooks)
     _applied_lora_hooks.clear()
+    _restore_lora_hooks(hooks)
     _lora_state = None
 
 
 def _reset_pipeline():
     """Drop the resident pipeline if a model or quantization change requires a reload."""
-    global _pipeline, _pipeline_model_dir, _pipeline_quant, _lora_state
+    global _pipeline, _pipeline_model_dir, _pipeline_quant, _pipeline_load_time, _lora_state
     _prompt_cache.clear()
     _unload_loras()
     _pipeline = None
     _pipeline_model_dir = None
     _pipeline_quant = None
+    _pipeline_load_time = 0.0
     _lora_state = None
     gc.collect()
+    try:
+        mx.clear_cache()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- schedulers
 def make_scheduler(name: str):
     from mlx_diffuser.schedulers import DDIMScheduler, EulerDiscreteScheduler
     from mlx_diffuser.schedulers.euler import EulerConfig
-    from mlx_diffuser.schedulers.ddpm import DDPMConfig
 
     if name in ("euler_a", "euler_a_substep"):
         return EulerAncestralScheduler(
@@ -508,7 +568,7 @@ def _map_kohya_key(key: str):
     m = re.match(r"(input_blocks|output_blocks)_(\d+)_(\d+)_(.+)", rest)
     if not m:
         return None
-    kind, a, b, tail = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+    kind, a, _, tail = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
     mt = re.match(r"transformer_blocks_(\d+)_(.+)", tail)
     if mt:
         sub = suffix_map.get(mt.group(2))
@@ -531,39 +591,54 @@ def _map_kohya_key(key: str):
     return comp, path
 
 
-def _read_safetensors_tensor(fh, info, offset_base):
-    """Reader supporting F32/F16/BF16/integers without torch."""
-    dtype, shape = info["dtype"], info["shape"]
-    start, end = info["data_offsets"]
+def _read_safetensors_tensor(fh, info, offset_base, file_size=None):
+    dtype = info.get("dtype") if isinstance(info, dict) else None
+    shape = info.get("shape") if isinstance(info, dict) else None
+    offsets = info.get("data_offsets") if isinstance(info, dict) else None
+    if not isinstance(dtype, str) or not isinstance(shape, list) or not isinstance(offsets, list) or len(offsets) != 2:
+        raise ValueError("invalid safetensors tensor metadata")
+    if any(not isinstance(v, int) or v < 0 for v in shape):
+        raise ValueError("invalid safetensors tensor shape")
+    if any(not isinstance(v, int) for v in offsets) or offsets[1] < offsets[0]:
+        raise ValueError("invalid safetensors tensor offsets")
+    start, end = offsets
+    absolute_end = offset_base + end
+    if start < 0 or (file_size is not None and absolute_end > file_size):
+        raise ValueError("safetensors tensor exceeds file bounds")
     fh.seek(offset_base + start)
     buf = fh.read(end - start)
-    if dtype == "F32":
-        return np.frombuffer(buf, dtype="<f4").reshape(shape)
-    if dtype == "F16":
-        return np.frombuffer(buf, dtype="<f2").astype(np.float32).reshape(shape)
-    if dtype == "BF16":
-        u16 = np.frombuffer(buf, dtype="<u2")
-        return (u16.astype(np.uint32) << 16).view("<f4").reshape(shape)
-    if dtype == "F64":
-        return np.frombuffer(buf, dtype="<f8").astype(np.float32).reshape(shape)
-    if dtype in ("I64", "INT64"):
-        return np.frombuffer(buf, dtype="<i8").reshape(shape)
-    if dtype in ("I32", "INT32"):
-        return np.frombuffer(buf, dtype="<i4").reshape(shape)
-    if dtype in ("I16", "INT16"):
-        return np.frombuffer(buf, dtype="<i2").reshape(shape)
-    if dtype in ("I8", "INT8"):
-        return np.frombuffer(buf, dtype="<i1").reshape(shape)
-    if dtype in ("U64", "UINT64"):
-        return np.frombuffer(buf, dtype="<u8").reshape(shape)
-    if dtype in ("U32", "UINT32"):
-        return np.frombuffer(buf, dtype="<u4").reshape(shape)
-    if dtype in ("U16", "UINT16"):
-        return np.frombuffer(buf, dtype="<u2").reshape(shape)
-    if dtype in ("U8", "UINT8"):
-        return np.frombuffer(buf, dtype="<u1").reshape(shape)
-    if dtype == "BOOL":
-        return np.frombuffer(buf, dtype="?").reshape(shape)
+    if len(buf) != end - start:
+        raise ValueError("truncated safetensors tensor")
+    try:
+        if dtype == "F32":
+            return np.frombuffer(buf, dtype="<f4").reshape(shape)
+        if dtype == "F16":
+            return np.frombuffer(buf, dtype="<f2").astype(np.float32).reshape(shape)
+        if dtype == "BF16":
+            u16 = np.frombuffer(buf, dtype="<u2")
+            return (u16.astype(np.uint32) << 16).view("<f4").reshape(shape)
+        if dtype == "F64":
+            return np.frombuffer(buf, dtype="<f8").astype(np.float32).reshape(shape)
+        if dtype in ("I64", "INT64"):
+            return np.frombuffer(buf, dtype="<i8").reshape(shape)
+        if dtype in ("I32", "INT32"):
+            return np.frombuffer(buf, dtype="<i4").reshape(shape)
+        if dtype in ("I16", "INT16"):
+            return np.frombuffer(buf, dtype="<i2").reshape(shape)
+        if dtype in ("I8", "INT8"):
+            return np.frombuffer(buf, dtype="<i1").reshape(shape)
+        if dtype in ("U64", "UINT64"):
+            return np.frombuffer(buf, dtype="<u8").reshape(shape)
+        if dtype in ("U32", "UINT32"):
+            return np.frombuffer(buf, dtype="<u4").reshape(shape)
+        if dtype in ("U16", "UINT16"):
+            return np.frombuffer(buf, dtype="<u2").reshape(shape)
+        if dtype in ("U8", "UINT8"):
+            return np.frombuffer(buf, dtype="<u1").reshape(shape)
+        if dtype == "BOOL":
+            return np.frombuffer(buf, dtype="?").reshape(shape)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"invalid {dtype} tensor: {e}") from e
     raise ValueError(f"unsupported dtype {dtype}")
 
 
@@ -571,16 +646,27 @@ def load_multilora(pipe, loras: list[dict]):
     """loras: [{path, scale}]. Stacks adapters via rank concatenation."""
     from mlx_diffuser.lora.lora import LoRALinear
 
-    components = {"unet": pipe.unet,
-                  "text_encoder": pipe.text_encoder,
-                  "text_encoder_2": pipe.text_encoder_2}
+    components = {
+        "unet": pipe.unet,
+        "text_encoder": pipe.text_encoder,
+        "text_encoder_2": pipe.text_encoder_2,
+    }
+    deltas = {}
 
-    deltas = {}  # component -> path -> list[(A, B)]
     for lora in loras:
-        scale = float(lora.get("scale", 1.0))
-        path = Path(lora["path"]).expanduser().resolve()
+        if not isinstance(lora, dict) or not lora.get("path"):
+            raise ValueError("each LoRA must contain a path")
+        try:
+            scale = float(lora.get("scale", 1.0))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"invalid LoRA scale in {lora.get('path')!r}") from e
+        if not math.isfinite(scale) or scale < 0:
+            raise ValueError(f"invalid LoRA scale in {lora.get('path')!r}")
+        path = Path(str(lora["path"])).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"LoRA file not found: {path}")
+        if path.suffix.lower() != ".safetensors":
+            raise ValueError(f"LoRA must be a .safetensors file: {path.name}")
         file_size = path.stat().st_size
         if file_size < 16:
             raise ValueError(f"LoRA file too small ({file_size} bytes): {path.name}")
@@ -601,58 +687,94 @@ def load_multilora(pipe, loras: list[dict]):
             try:
                 header = json.loads(header_bytes.decode("utf-8"))
             except Exception as e:
-                raise ValueError(f"Failed to parse safetensors JSON header in {path.name}: {e}")
+                raise ValueError(f"Failed to parse safetensors JSON header in {path.name}: {e}") from e
+            if not isinstance(header, dict):
+                raise ValueError(f"Safetensors header is not an object: {path.name}")
             base_off = 8 + n
-            for k, info in header.items():
-                if k == "__metadata__":
+            for key, info in header.items():
+                if key == "__metadata__":
                     continue
-                if k.endswith(".alpha"):
+                if not isinstance(info, dict):
+                    raise ValueError(f"Invalid tensor metadata for {key} in {path.name}")
+                offsets = info.get("data_offsets")
+                shape = info.get("shape")
+                if (
+                    not isinstance(offsets, list)
+                    or len(offsets) != 2
+                    or any(not isinstance(v, int) for v in offsets)
+                    or offsets[0] < 0
+                    or offsets[1] < offsets[0]
+                    or base_off + offsets[1] > file_size
+                    or not isinstance(shape, list)
+                    or any(not isinstance(v, int) or v < 0 for v in shape)
+                    or math.prod(shape) <= 0
+                ):
+                    raise ValueError(f"Invalid tensor metadata for {key} in {path.name}")
+                if key.endswith(".alpha"):
                     part = "alpha"
-                    b = k[: -len(".alpha")]
-                elif k.endswith(".lora_down.weight"):
+                    base = key[: -len(".alpha")]
+                elif key.endswith(".lora_down.weight"):
                     part = "down"
-                    b = k[: -len(".lora_down.weight")]
-                elif k.endswith(".lora_up.weight"):
+                    base = key[: -len(".lora_down.weight")]
+                elif key.endswith(".lora_up.weight"):
                     part = "up"
-                    b = k[: -len(".lora_up.weight")]
-                elif k.endswith(".lora_A.weight"):
+                    base = key[: -len(".lora_up.weight")]
+                elif key.endswith(".lora_A.weight"):
                     part = "down"
-                    b = k[: -len(".lora_A.weight")]
-                elif k.endswith(".lora_B.weight"):
+                    base = key[: -len(".lora_A.weight")]
+                elif key.endswith(".lora_B.weight"):
                     part = "up"
-                    b = k[: -len(".lora_B.weight")]
-                elif k.endswith(".down.weight"):
+                    base = key[: -len(".lora_B.weight")]
+                elif key.endswith(".down.weight"):
                     part = "down"
-                    b = k[: -len(".down.weight")]
-                elif k.endswith(".up.weight"):
+                    base = key[: -len(".down.weight")]
+                elif key.endswith(".up.weight"):
                     part = "up"
-                    b = k[: -len(".up.weight")]
+                    base = key[: -len(".up.weight")]
                 else:
                     continue
-                entries.setdefault(b, {})[part] = _read_safetensors_tensor(
-                    fh, info, base_off)
-        for b_, parts in entries.items():
-            mapped = _map_kohya_key(b_)
-            if not mapped or "down" not in parts or "up" not in parts:
+                entries.setdefault(base, {})[part] = _read_safetensors_tensor(
+                    fh, info, base_off, file_size
+                )
+
+        mapped_pairs = 0
+        for base, parts in entries.items():
+            mapped = _map_kohya_key(base)
+            if mapped is None:
                 continue
-            comp, mpath = mapped
-            rank = parts["down"].shape[0]
+            if "down" not in parts or "up" not in parts:
+                raise ValueError(f"Incomplete LoRA pair for {base} in {path.name}")
+            down = parts["down"]
+            up = parts["up"]
+            if down.ndim != 2 or up.ndim != 2 or down.shape[0] <= 0:
+                raise ValueError(f"Invalid LoRA tensor rank for {base} in {path.name}")
+            if down.shape[1] <= 0 or up.shape[0] <= 0 or down.shape[0] != up.shape[1]:
+                raise ValueError(f"LoRA A/B shape mismatch for {base} in {path.name}")
+            rank = down.shape[0]
             if "alpha" in parts:
-                alpha = float(np.asarray(parts["alpha"]).reshape(-1)[0])
+                alpha_values = np.asarray(parts["alpha"]).reshape(-1)
+                if alpha_values.size != 1:
+                    raise ValueError(f"Invalid LoRA alpha for {base} in {path.name}")
+                alpha = float(alpha_values[0])
             else:
                 alpha = float(rank)
+            if not math.isfinite(alpha) or rank <= 0:
+                raise ValueError(f"Invalid LoRA alpha/rank for {base} in {path.name}")
             eff = scale * alpha / rank
-            A = parts["down"].astype(np.float32) * eff  # (rank, in)
-            B = parts["up"].astype(np.float32)          # (out, rank)
-            deltas.setdefault(comp, {}).setdefault(mpath, []).append((A, B))
+            mapped_pairs += 1
+            deltas.setdefault(mapped[0], {}).setdefault(mapped[1], []).append(
+                (down.astype(np.float32) * eff, up.astype(np.float32))
+            )
+        if mapped_pairs == 0:
+            raise ValueError(f"LoRA contains no supported SDXL layers: {path.name}")
 
-    total, missed = 0, 0
+    pending = []
     for comp, paths in deltas.items():
         model = components[comp]
-        for path, stack in paths.items():
-            segs = path.split(".")
+        for module_path, stack in paths.items():
+            segs = module_path.split(".")
+            parent = model
             try:
-                parent = model
                 for seg in segs[:-1]:
                     if isinstance(parent, (list, tuple)):
                         parent = parent[int(seg)]
@@ -661,61 +783,148 @@ def load_multilora(pipe, loras: list[dict]):
                     else:
                         parent = parent[int(seg)] if seg.isdigit() else parent[seg]
                 last = segs[-1]
-                if isinstance(parent, (list, tuple)) or (last.isdigit() and isinstance(parent, list)):
+                if isinstance(parent, (list, tuple)):
                     linear = parent[int(last)]
                 elif hasattr(parent, last):
                     linear = getattr(parent, last)
                 else:
                     linear = parent[last]
-                if type(linear).__name__ not in ("Linear", "QuantizedLinear"):
-                    raise TypeError(f"{last} is {type(linear).__name__}")
-                adapter = LoRALinear(linear, rank=8, alpha=16.0)
-                As = [x[0] for x in stack]
-                Bs = [x[1] for x in stack]
-                adapter.lora_a = mx.array(np.concatenate(As, axis=0))
-                adapter.lora_b = mx.array(np.concatenate(Bs, axis=1))
-                adapter.scale = 1.0
-                _applied_lora_hooks.append((comp, parent, last, linear))
-                if isinstance(parent, list) or (last.isdigit() and isinstance(parent, list)):
-                    parent[int(last)] = adapter
-                else:
-                    setattr(parent, last, adapter)
-                total += 1
-            except Exception as e:
-                missed += 1
-                print(f"[sdxl] WARN skip {comp}:{path}: {e}", file=sys.stderr)
+            except (KeyError, IndexError, TypeError, ValueError) as e:
+                raise ValueError(f"LoRA target {comp}:{module_path} is unavailable") from e
+            if type(linear).__name__ not in ("Linear", "QuantizedLinear"):
+                raise ValueError(f"LoRA target {comp}:{module_path} is {type(linear).__name__}")
+            if type(linear).__name__ == "QuantizedLinear":
+                out_features = linear.weight.shape[0]
+                in_features = linear.scales.shape[1] * linear.group_size
+            else:
+                out_features, in_features = linear.weight.shape
+            for down, up in stack:
+                if down.shape[1] != in_features or up.shape[0] != out_features:
+                    raise ValueError(f"LoRA shape does not fit {comp}:{module_path}")
+            adapter = LoRALinear(linear, rank=8, alpha=16.0)
+            adapter.lora_a = mx.array(np.concatenate([x[0] for x in stack], axis=0))
+            adapter.lora_b = mx.array(np.concatenate([x[1] for x in stack], axis=1))
+            adapter.scale = 1.0
+            pending.append((comp, parent, last, linear, adapter))
+
+    staged = []
+    try:
+        for comp, parent, last, linear, adapter in pending:
+            _replace_module(parent, last, adapter)
+            staged.append((comp, parent, last, linear))
+        for comp in deltas:
+            mx.eval(components[comp].parameters())
+    except Exception:
+        _restore_lora_hooks(staged)
+        raise
+    _applied_lora_hooks.extend(staged)
     if "text_encoder" in deltas or "text_encoder_2" in deltas:
         _prompt_cache.clear()
-    for comp in deltas:
-        mx.eval(components[comp].parameters())
-    return total
+    return len(pending)
+
+
+@contextmanager
+def _deepcache_final_step(total_steps: int):
+    from mlx_diffuser.caching import DeepCache
+
+    original_init = DeepCache.__init__
+    original_should_reuse = DeepCache.should_reuse
+
+    def patched_init(self, interval=1):
+        original_init(self, interval)
+        self._mlx_total_steps = total_steps
+
+    def patched_should_reuse(self):
+        if getattr(self, "_mlx_total_steps", None) == self.steps + 1:
+            self.steps += 1
+            return False
+        return original_should_reuse(self)
+
+    DeepCache.__init__ = patched_init
+    DeepCache.should_reuse = patched_should_reuse
+    try:
+        yield
+    finally:
+        DeepCache.__init__ = original_init
+        DeepCache.should_reuse = original_should_reuse
 
 
 # ---------------------------------------------------------------- pipeline
+def _lora_signature(path: str) -> tuple:
+    resolved = Path(path).expanduser().resolve()
+    try:
+        stat = resolved.stat()
+        return (str(resolved), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return (str(resolved), None, None)
+
+
 def generate(req: dict) -> dict:
     import time
 
+    if not isinstance(req, dict):
+        raise ValueError("request must be an object")
+    if req.get("reference_images") or req.get("image"):
+        raise ValueError("SDXL reference-image conditioning is not supported")
+    try:
+        width = int(req["width"])
+        height = int(req["height"])
+        steps = int(req["steps"])
+        seed = int(req.get("seed", 0))
+        quant = int(req.get("quantize_unet", 4))
+        cache_interval = int(req.get("cache_interval", 1))
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError("invalid SDXL generation dimensions or steps") from e
+    if width < 128 or height < 128 or width > 2048 or height > 2048 or width % 8 or height % 8:
+        raise ValueError("SDXL width and height must be multiples of 8 within 128-2048")
+    if steps < 1 or steps > 50:
+        raise ValueError("SDXL steps must be between 1 and 50")
+    if quant not in (4,):
+        raise ValueError("SDXL UNet quantization must be 4")
+    if not 1 <= cache_interval <= 10:
+        raise ValueError("SDXL cache_interval must be between 1 and 10")
+    sampler = str(req.get("sampler") or "dpmpp_2m_karras")
+    allowed_samplers = {
+        "euler_trailing", "trailing", "dpmpp_2m_karras",
+        "dpmpp_2m_karras_trailing", "euler_a_substep", "euler_a", "euler", "ddim",
+    }
+    if sampler not in allowed_samplers:
+        raise ValueError(f"unsupported SDXL sampler: {sampler}")
+    loras = req.get("loras") or []
+    if not isinstance(loras, list) or len(loras) > 16:
+        raise ValueError("SDXL LoRA list must contain at most 16 entries")
+    prompt_text = str(req.get("prompt") or "")
+    negative_text = str(req.get("negative_prompt") or "")
+    if not prompt_text.strip():
+        raise ValueError("prompt is required")
+    if not req.get("dest"):
+        raise ValueError("dest is required")
+    if len(prompt_text.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        raise ValueError("prompt exceeds the 128 KiB limit")
+    if len(negative_text.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        raise ValueError("negative prompt exceeds the 128 KiB limit")
+
     model_dir = req.get("model_dir")
-    quant = req.get("quantize_unet", 4)
     target_dir = Path(model_dir).resolve() if model_dir else DEFAULT_MODEL_DIR.resolve()
-    target_quant = quant or None
+    target_quant = quant
     if _pipeline is not None and _pipeline_model_dir == target_dir and _pipeline_quant == target_quant:
         _write_ipc_json({"phase": "preparing", "detail": "Preparing prompt conditioning & latents..."})
     pipe = get_pipeline(model_dir=model_dir, quantize_unet=quant)
-    pipe.scheduler = make_scheduler(req.get("sampler", "dpmpp_2m_karras"))
-    pipe.scheduler._seed = req.get("seed", 0)
+    pipe.scheduler = make_scheduler(sampler)
+    pipe.scheduler._seed = seed
     global _lora_state
     state = tuple(sorted(
-        (str(Path(l["path"]).expanduser().resolve()),
-         float(l.get("scale", 1.0))) for l in req.get("loras") or []))
+        (*_lora_signature(str(l["path"])), float(l.get("scale", 1.0)))
+        for l in loras
+    ))
     if state != _lora_state:
-        if _lora_state is not None:
-            # Revert adapters without dropping base model pipeline
-            _unload_loras()
-        if req.get("loras"):
+        _unload_loras()
+        if loras:
             try:
-                _write_ipc_json({"phase": "loading_model", "detail": f"Applying {len(req['loras'])} LoRA adapter(s)..."})
-                n = load_multilora(pipe, req["loras"])
+                _write_ipc_json({"phase": "loading_model", "detail": f"Applying {len(loras)} LoRA adapter(s)..."})
+                n = load_multilora(pipe, loras)
+                if n <= 0:
+                    raise ValueError("no LoRA layers were applied")
                 print(f"[sdxl] applied {n} LoRA layers", file=sys.stderr, flush=True)
                 _lora_state = state
             except Exception as e:
@@ -725,16 +934,18 @@ def generate(req: dict) -> dict:
         else:
             _lora_state = state
             print("[sdxl] no LoRA (clean weights)", file=sys.stderr, flush=True)
-    t0 = time.time()
 
+    t0 = time.monotonic()
+    steps_value = steps
     def _progress(t):
         _write_ipc_json({
             "phase": "generating",
-            "detail": f"Denoising step {t + 1}/{req['steps']}...",
-            "progress": {"step": t + 1, "steps": req["steps"]},
+            "detail": f"Denoising step {t + 1}/{steps_value}...",
+            "progress": {"step": t + 1, "steps": steps_value},
         })
 
     orig_step = pipe.scheduler.step
+
     def _step_progress(model_output, timestep, sample, **kwargs):
         res = orig_step(model_output, timestep, sample, **kwargs)
         idx = getattr(pipe.scheduler, "_step_index", None)
@@ -742,67 +953,119 @@ def generate(req: dict) -> dict:
         if idx is None and inner is not None:
             idx = getattr(inner, "_step_index", None)
         if idx is not None:
-            _progress(min(idx, req["steps"]) - 1)
+            _progress(min(idx, steps_value) - 1)
         return res
-    pipe.scheduler.step = _step_progress
 
-    # Wire engine memory during denoise: allow up to 70% of working memory
-    # to keep Metal from paging weights while leaving headroom for VAE decode.
+    pipe.scheduler.step = _step_progress
     prev_wired = None
+    effective_wired = 0
     try:
-        import mlx.core as _mx
-        d = _mx.device_info()
-        cap = d.get("max_recommended_working_set_size") or d.get("recommended_max_working_set_size", 0)
-        # Clamped to 6.5GB max on 16GB machines to guarantee OS and activations never trigger swap
-        limit = min(cap if cap > 0 else (6500 << 20), int(6.5 * (1 << 30)))
-        prev_wired = _mx.set_wired_limit(limit)
+        d = mx.device_info()
+        cap = d.get("max_recommended_working_set_size") or d.get("recommended_max_working_set_size") or 0
+        requested_wired = req.get("wired_limit_bytes")
+        if requested_wired is None:
+            limit = min(cap if cap > 0 else int(6.5 * (1 << 30)), int(6.5 * (1 << 30)))
+        else:
+            limit = max(0, int(requested_wired))
+            if cap > 0 and limit > 0:
+                limit = min(limit, cap)
+        if limit > 0:
+            limit = min(limit, int(6.5 * (1 << 30)))
+        effective_wired = limit
+        prev_wired = mx.set_wired_limit(limit) if limit > 0 else None
     except Exception:
         prev_wired = None
     try:
         pipe.vae.use_taesd = bool(req.get("fast_vae", True))
         guidance = req.get("guidance")
         if guidance is None:
-            # Distilled models (Lightning 4-step) require guidance=1.0 for single-pass CFG-free denoise
-            guidance = 1.0 if (req.get("steps", 4) <= 8 or "lightning" in str(req.get("model_dir", "")).lower()) else 2.4
+            guidance = 1.0 if (steps <= 8 or "lightning" in str(req.get("model_dir", "")).lower()) else 2.4
         else:
             guidance = float(guidance)
-
+        if not math.isfinite(guidance) or guidance < 0:
+            raise ValueError("SDXL guidance must be a finite non-negative number")
         _write_ipc_json({"phase": "compiling", "detail": "Compiling Metal scheduler & encoding prompt..."})
-        out = pipe(
-            req["prompt"],
-            negative_prompt=req.get("negative_prompt", ""),
-            height=req["height"],
-            width=req["width"],
-            num_inference_steps=req["steps"],
-            guidance_scale=guidance,
-            seed=req["seed"],
-            cache_interval=req.get("cache_interval", 1),
-            tile_vae=req.get("tile_vae", (req["width"] * req["height"] >= 768 * 768)),
-            # NOTE: must stay False in daemon mode — the library's release
-            # permanently drops the CLIP encoders (no lazy reload), killing
-            # every subsequent prompt. AGENTS.md claim is outdated.
-            release_text_encoders=False,
-            progress=False,
-        )
+        cache_context = _deepcache_final_step(steps) if cache_interval > 1 else None
+        if cache_context is None:
+            out = pipe(
+                prompt_text,
+                negative_prompt=negative_text,
+                height=height,
+                width=width,
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                seed=seed,
+                cache_interval=cache_interval,
+                tile_vae=bool(req.get("tile_vae", width * height >= 768 * 768)),
+                release_text_encoders=False,
+                progress=False,
+            )
+        else:
+            with cache_context:
+                out = pipe(
+                    prompt_text,
+                    negative_prompt=negative_text,
+                    height=height,
+                    width=width,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    seed=seed,
+                    cache_interval=cache_interval,
+                    tile_vae=bool(req.get("tile_vae", width * height >= 768 * 768)),
+                    release_text_encoders=False,
+                    progress=False,
+                )
+        mx.eval(out)
+    except BaseException:
+        gc.collect()
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
+        raise
     finally:
         pipe.scheduler.step = orig_step
         if prev_wired is not None:
             try:
-                import mlx.core as _mx
-                _mx.set_wired_limit(prev_wired)
+                mx.set_wired_limit(prev_wired)
             except Exception:
                 pass
-    elapsed = round(time.time() - t0, 2)
+    elapsed = round(time.monotonic() - t0, 2)
     image_id = req["image_id"]
     dest = Path(req["dest"])
-
+    dest.parent.mkdir(parents=True, exist_ok=True)
     _write_ipc_json({"phase": "saving", "detail": "Decoding VAE latents & saving image..."})
     arr = np.asarray(out[0])
     if arr.min() < 0.0:
         arr = (arr + 1.0) / 2.0
     img = (np.clip(arr, 0.0, 1.0) * 255.0).round().astype(np.uint8)
-    dest.write_bytes(img.tobytes())
-    return {"id": image_id, "generation_time": elapsed}
+    if img.shape[0] != height or img.shape[1] != width:
+        raise RuntimeError(f"SDXL returned {img.shape[1]}x{img.shape[0]}, expected {width}x{height}")
+    try:
+        dest.write_bytes(img.tobytes())
+    except Exception:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise
+    return {
+        "id": image_id,
+        "generation_time": elapsed,
+        "load_time": round(float(_pipeline_load_time), 2),
+        "sampler": sampler,
+        "scheduler": type(pipe.scheduler).__name__,
+        "guidance": guidance,
+        "width": width,
+        "height": height,
+        "quantization": target_quant,
+        "loras": loras,
+        "fast_vae": bool(req.get("fast_vae", True)),
+        "cache_interval": cache_interval,
+        "tile_vae": bool(req.get("tile_vae", width * height >= 768 * 768)),
+        "wired_limit_bytes": effective_wired,
+        "cache_final_step": cache_interval > 1,
+    }
 
 
 def _handle_signal(signum, frame):

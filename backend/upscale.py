@@ -1,19 +1,25 @@
 import json
-import os
-import sys
-import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
 from PIL import Image
 
-from image_meta import save_image_with_metadata, extract_image_metadata, _artist_fallback
+from image_meta import atomic_write_json, save_image_with_metadata, extract_image_metadata, _artist_fallback
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 GENERATED_DIR = DATA_DIR / "generated"
+MAX_UPSCALE_PIXELS = 64 * 1024 * 1024
+_UPSCALE_SLOTS = threading.BoundedSemaphore(1)
+_THUMBNAIL_SLOTS = threading.BoundedSemaphore(1)
 
 
 def upscale_image(image_id: str, scale: int = 2) -> dict:
+    with _UPSCALE_SLOTS:
+        return _upscale_image(image_id, scale)
+
+
+def _upscale_image(image_id: str, scale: int = 2) -> dict:
     """Upscale image using fast Lanczos resampling with unsharp masking."""
     src_img = GENERATED_DIR / f"{image_id}.png"
     if not src_img.exists():
@@ -36,9 +42,15 @@ def upscale_image(image_id: str, scale: int = 2) -> dict:
     actual_method = f"lanczos_{scale}x"
 
     with Image.open(src_img) as img:
-        img = img.convert("RGB")
         w, h = img.size
+        output_pixels = w * h * scale * scale
+        if output_pixels > MAX_UPSCALE_PIXELS:
+            raise ValueError(
+                f"upscale output {w * scale}x{h * scale} exceeds "
+                f"{MAX_UPSCALE_PIXELS} pixel limit"
+            )
         new_w, new_h = w * scale, h * scale
+        img = img.convert("RGB")
 
         # High quality Lanczos resampling
         upscaled = img.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
@@ -55,6 +67,7 @@ def upscale_image(image_id: str, scale: int = 2) -> dict:
     elapsed = round(time.time() - t0, 2)
     new_w, new_h = upscaled.size
 
+    tags = list(dict.fromkeys((parent_meta.get("tags") or []) + ["upscaled", actual_method]))
     meta = dict(parent_meta)
     meta.update({
         "id": new_id,
@@ -70,7 +83,7 @@ def upscale_image(image_id: str, scale: int = 2) -> dict:
         "artist": _artist_fallback(parent_meta.get("artist")),
         "file": dest_path.name,
         "format": fmt,
-        "tags": list(set((parent_meta.get("tags") or []) + ["upscaled", actual_method])),
+        "tags": tags,
     })
 
     stealth = bool(parent_meta.get("stealth", False))
@@ -81,7 +94,11 @@ def upscale_image(image_id: str, scale: int = 2) -> dict:
         output_format=fmt,
         stealth=stealth,
     )
-    (GENERATED_DIR / f"{new_id}.json").write_text(json.dumps(meta, indent=2))
+    try:
+        upscaled.close()
+    except Exception:
+        pass
+    atomic_write_json(GENERATED_DIR / f"{new_id}.json", meta)
     try:
         thumbnail_path(new_id)
     except Exception:
@@ -90,6 +107,11 @@ def upscale_image(image_id: str, scale: int = 2) -> dict:
 
 
 def thumbnail_path(image_id: str, force_recreate: bool = False) -> Path:
+    with _THUMBNAIL_SLOTS:
+        return _thumbnail_path(image_id, force_recreate)
+
+
+def _thumbnail_path(image_id: str, force_recreate: bool = False) -> Path:
     thumb = GENERATED_DIR / f"{image_id}_thumb.png"
     src = GENERATED_DIR / f"{image_id}.png"
     if not src.exists():
@@ -124,18 +146,13 @@ def thumbnail_path(image_id: str, force_recreate: bool = False) -> Path:
                         stealth=False,
                     )
                 else:
-                    fd, tmp = tempfile.mkstemp(dir=str(GENERATED_DIR), suffix=".png.tmp")
-                    try:
-                        with os.fdopen(fd, "wb") as f:
-                            img.save(f, format="PNG")
-                        os.replace(tmp, thumb)
-                    except Exception:
-                        if os.path.exists(tmp):
-                            try:
-                                os.unlink(tmp)
-                            except OSError:
-                                pass
-                        raise
+                    save_image_with_metadata(
+                        image=img,
+                        dest_path=thumb,
+                        meta=meta or {},
+                        output_format="png",
+                        stealth=True,
+                    )
         except Exception:
             pass
     return thumb

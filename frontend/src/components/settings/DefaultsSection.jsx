@@ -279,7 +279,7 @@ export default function DefaultsSection({ settings, models, update, onFeedback }
                 <span>Width</span>
                 <input
                   type="number"
-                  min={256}
+                  min={128}
                   max={4096}
                   step={64}
                   value={draft.width || ""}
@@ -291,7 +291,7 @@ export default function DefaultsSection({ settings, models, update, onFeedback }
                 <span>Height</span>
                 <input
                   type="number"
-                  min={256}
+                  min={128}
                   max={4096}
                   step={64}
                   value={draft.height || ""}

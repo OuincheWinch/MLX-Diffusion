@@ -18,6 +18,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app_settings import metadata_artist  # noqa: E402
+from image_meta import atomic_write_json
 from generator import (  # noqa: E402
     DATA_DIR,
     GENERATED_DIR,
@@ -71,7 +72,7 @@ def process_images(hours: float = 48.0, process_all: bool = False):
             meta["artist"] = metadata_artist()
 
         model_name = str(meta.get("model", ""))
-        minfo = get_model_info(model_name) if model_name else {}
+        minfo = (get_model_info(model_name) if model_name else None) or {}
         if minfo.get("civitai_version_id"):
             meta["modelVersionId"] = minfo["civitai_version_id"]
         if minfo.get("civitai_model_id"):
@@ -113,7 +114,7 @@ def process_images(hours: float = 48.0, process_all: bool = False):
                 output_format=fmt,
                 stealth=stealth,
             )
-            jpath.write_text(json.dumps(meta, indent=2))
+            atomic_write_json(jpath, meta)
 
             # Also embed full Civitai metadata into thumbnail
             thumb_path = GENERATED_DIR / f"{jpath.stem}_thumb.png"

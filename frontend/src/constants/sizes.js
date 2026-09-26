@@ -3,6 +3,8 @@ export const STANDARD_SIZES = [
   { value: "1024x1024", label: "■ 1024 × 1024 (1:1)" },
   { value: "768x768", label: "■ 768 × 768 (1:1)" },
   { value: "512x512", label: "■ 512 × 512 (1:1)" },
+  { value: "256x256", label: "■ 256 × 256 (1:1)" },
+  { value: "128x128", label: "■ 128 × 128 (1:1)" },
 
   // Landscape / Cinematic
   { value: "1216x832", label: "▬ 1216 × 832 (Cinematic ~3:2)" },

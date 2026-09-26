@@ -1,4 +1,4 @@
-import { imageUrl, fetchImageBlob, API_BASE } from "../api.js";
+import { imageUrl, fetchImageBlob, api } from "../api.js";
 
 // In-memory cache for pre-fetched full resolution Files
 // Key: image_id -> { file: File, timestamp: number }
@@ -216,8 +216,8 @@ export async function revealImageInFinder(imageOrId) {
   if (!id) return false;
 
   try {
-    const res = await fetch(`${API_BASE}/api/images/${id}/reveal`, { method: "POST" });
-    return res.ok;
+    await api(`/api/images/${id}/reveal`, { method: "POST" });
+    return true;
   } catch (err) {
     console.error("[dragDrop] Failed to reveal in Finder:", err);
     return false;

@@ -125,6 +125,7 @@ function GenerationStack() {
           <span className="gen-stack-actions">
             {active.some((j) => j.status === "generating") && (
               <button
+                type="button"
                 className="btn-mini"
                 onClick={() => {
                   const run = active.find((j) => j.status === "generating");
@@ -135,12 +136,13 @@ function GenerationStack() {
               </button>
             )}
             {active.length > 1 && (
-              <button className="btn-mini" onClick={emptyQueue}>
+              <button type="button" className="btn-mini" onClick={emptyQueue}>
                 ⌫ Empty queue
               </button>
             )}
             {recoverableItems.length > 0 && (
               <button
+                type="button"
                 className="btn-mini btn-recovery-trigger"
                 onClick={() => setShowRecovery(true)}
                 title="Consulter et réinsérer les prompts annulés ou interrompus"
@@ -157,6 +159,7 @@ function GenerationStack() {
               ⚡ {interruptedCount} génération{interruptedCount > 1 ? "s" : ""} interrompue{interruptedCount > 1 ? "s" : ""} lors de la dernière session
             </span>
             <button
+              type="button"
               className="btn-mini btn-crash-restore"
               onClick={() => setShowRecovery(true)}
             >
@@ -191,6 +194,7 @@ function GenerationStack() {
               </div>
               {["queued", "generating"].includes(j.status) && (
                 <button
+                  type="button"
                   className="btn-mini gen-stack-kill"
                   title="Cancel this job"
                   onClick={() => cancelJob(j.id)}

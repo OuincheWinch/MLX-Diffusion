@@ -21,6 +21,7 @@ Usage:
   ./venv/bin/python backend/scripts/repeatability_test.py --models all --scenes all
 """
 import argparse
+import importlib.metadata
 import json
 import re
 import shutil
@@ -36,8 +37,10 @@ TEST_DIR = PROJECT_ROOT / "test"
 TEST_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_ARENA = PROJECT_ROOT / "comparison_12_vs_4_steps"
 
+from image_meta import atomic_write_json
 import numpy as np
 from PIL import Image
+import mlx.core as mx
 
 import generator
 
@@ -73,6 +76,55 @@ def lora_req(names: list[str]) -> list[dict]:
             path = (BACKEND_DIR / path).resolve()
         reqs.append({"name": n, "path": str(path.resolve()), "scale": LORA_SCALE})
     return reqs
+
+
+def _dependency_versions() -> dict:
+    names = ("mlx", "mflux", "mlx-lm", "mlx-diffuser", "numpy", "pillow")
+    versions = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def _memory_snapshot() -> dict:
+    snapshot = {}
+    for key, name in (
+        ("active_bytes", "get_active_memory"),
+        ("peak_bytes", "get_peak_memory"),
+        ("cache_bytes", "get_cache_memory"),
+    ):
+        getter = getattr(mx, name, None) or getattr(mx.metal, name, None)
+        snapshot[key] = int(getter()) if getter else None
+    return snapshot
+
+
+def _reset_peak_memory() -> None:
+    reset = getattr(mx, "reset_peak_memory", None) or getattr(mx.metal, "reset_peak_memory", None)
+    if reset:
+        reset()
+
+
+def _phase_timings(events: list[tuple[str, float]], start: float, end: float) -> dict:
+    if not events:
+        return {"unattributed": round(max(0.0, end - start), 3)}
+    totals = {"unattributed_before_first_phase": round(max(0.0, events[0][1] - start), 3)}
+    for index, (phase, timestamp) in enumerate(events):
+        next_timestamp = events[index + 1][1] if index + 1 < len(events) else end
+        duration = max(0.0, next_timestamp - timestamp)
+        totals[phase] = round(totals.get(phase, 0.0) + duration, 3)
+    return totals
+
+
+def _pipeline_cache_state(cfg: dict, loras: list[dict]) -> str:
+    if cfg["model"] in ("juggernaut-xl-lightning", "realvis-xl-v5-lightning", "realvis-xl-v5", "juggernaut-xi"):
+        daemon = getattr(generator, "_sdxl_daemon", None)
+        current = str(getattr(generator, "_current_sdxl_model", "") or "")
+        return "warm" if daemon is not None and daemon.poll() is None and cfg["model"] in current else "cold"
+    expected_key = (cfg["model"], 4, tuple(sorted(l["path"] for l in loras)), "standard")
+    return "warm" if getattr(generator, "_current_pipeline_key", None) == expected_key else "cold"
 
 
 def parse_scenes(arena: Path):
@@ -185,10 +237,18 @@ def resolve(cfg: dict, scene: dict, arena_img: Path):
 
 def run_one(cfg: dict, scene: dict, arena_img: Path, out_dir: Path, use: dict):
     step_ts = {}
+    phase_events = []
+    loras = lora_req(cfg["loras"])
+    pipeline_cache = _pipeline_cache_state(cfg, loras)
 
     def _cb(step, *_a, **_k):
         step_ts[step] = time.perf_counter()
 
+    def _phase(phase, detail=None):
+        phase_events.append((phase, time.perf_counter()))
+
+    _reset_peak_memory()
+    memory_before = _memory_snapshot()
     t0 = time.perf_counter()
     meta = generator.generate(
         prompt=use["prompt"],
@@ -202,10 +262,14 @@ def run_one(cfg: dict, scene: dict, arena_img: Path, out_dir: Path, use: dict):
         model=cfg["model"],
         sampler=use["sampler"],
         fast_vae=cfg["fast_vae"],
-        loras=lora_req(cfg["loras"]),
+        loras=loras,
         progress_cb=_cb,
+        phase_cb=_phase,
     )
-    gen_s = round(time.perf_counter() - t0, 2)
+    gen_end = time.perf_counter()
+    gen_s = round(gen_end - t0, 2)
+    phases = _phase_timings(phase_events, t0, gen_end)
+    memory_after = _memory_snapshot()
     s_per_iter = "—"
     ks = sorted(step_ts)
     if len(ks) >= 2:
@@ -218,11 +282,24 @@ def run_one(cfg: dict, scene: dict, arena_img: Path, out_dir: Path, use: dict):
     stored = pixels(Image.open(arena_img))
     fresh = pixels(Image.open(today_p))
     same = bool((stored == fresh).all())
+    sdxl_model = cfg["model"] in (
+        "juggernaut-xl-lightning",
+        "realvis-xl-v5-lightning",
+        "realvis-xl-v5",
+        "juggernaut-xi",
+    )
     res = {
         "model": cfg["model"], "scene": scene["id"], "seed": use["seed"],
         "steps": use["steps"], "guidance": use["guidance"], "sampler": use["sampler"] or "model-default",
         "fast_vae": cfg["fast_vae"], "prompt_used": use["prompt"][:90],
+        "pipeline_cache": pipeline_cache,
+        "dependencies": _dependency_versions(),
+        "memory_scope": "api-parent-only; SDXL subprocess memory unavailable" if sdxl_model else "api-process",
+        "memory": {"before": memory_before, "after": memory_after},
+        "phase_sequence": [phase for phase, _ in phase_events],
+        "phases": phases,
         "generation_time_s": gen_s, "s_per_iter": s_per_iter,
+        "timing_scope": "generator.generate wall time with recorded pipeline cache state",
         "today_png": str(today_p), "data_generated": meta["file"],
         "verdict": "BIT-IDENTICAL" if same else "DIFFERS",
         "psnr_db": round(psnr(stored, fresh), 2) if not same else None,
@@ -259,22 +336,23 @@ def summarize(results: list[dict], out_dir: Path, stamp: str):
         print(f"\n== {m} | {cfg_parts[0]} ==", flush=True)
         lines.append(f"## {m} — {c0.get('sampler')} {c0.get('steps')} steps, cfg {c0.get('guidance')}, fast_vae {c0.get('fast_vae')}")
         lines.append("")
-        lines.append("| scene | today (s) | arena (s) | Δ% | s/it | verdict |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| scene | today (s) | cache | arena (s) | Δ% | s/it | verdict |")
+        lines.append("|---|---|---|---|---|---|---|")
         for r in rs:
-            line = (f"| {r['scene']} | {r['generation_time_s']} | {r.get('arena_time_s', '—')} | "
+            line = (f"| {r['scene']} | {r['generation_time_s']} | {r.get('pipeline_cache', 'unknown')} | {r.get('arena_time_s', '—')} | "
                     f"{_pct(r['generation_time_s'], r.get('arena_time_s'))} | {r.get('s_per_iter', '—')} | {r['verdict']} |")
-            print(f"  {r['scene']:22s} today {r['generation_time_s']:>7}s arena {r.get('arena_time_s', '—')}  "
+            print(f"  {r['scene']:22s} today {r['generation_time_s']:>7}s cache {r.get('pipeline_cache', 'unknown'):4s} arena {r.get('arena_time_s', '—')}  "
                   f"d% {_pct(r['generation_time_s'], r.get('arena_time_s'))}  s/it {r.get('s_per_iter', '—')}  {r['verdict']}", flush=True)
             lines.append(line)
         ok = [r for r in rs if r.get("arena_time_s") is not None]
-        if ok:
-            mean_t = sum(r["generation_time_s"] for r in ok) / len(ok)
-            mean_a = sum(r["arena_time_s"] for r in ok) / len(ok)
-            it = [r.get("s_per_iter") for r in ok if r.get("s_per_iter") not in (None, "—")]
+        for cache in sorted({r.get("pipeline_cache", "unknown") for r in ok}):
+            cache_rows = [r for r in ok if r.get("pipeline_cache", "unknown") == cache]
+            mean_t = sum(r["generation_time_s"] for r in cache_rows) / len(cache_rows)
+            mean_a = sum(r["arena_time_s"] for r in cache_rows) / len(cache_rows)
+            it = [r.get("s_per_iter") for r in cache_rows if r.get("s_per_iter") not in (None, "—")]
             mean_it = f"{sum(it) / len(it):.2f}" if it else "—"
-            lines.append(f"| **mean** | **{mean_t:.2f}** | **{mean_a:.2f}** | **{_pct(mean_t, mean_a)}** | **{mean_it}** | |")
-            print(f"  {'mean':22s} today {mean_t:>7.2f}s arena {mean_a:.2f}  d% {_pct(mean_t, mean_a)}  s/it {mean_it}", flush=True)
+            lines.append(f"| **mean {cache}** | **{mean_t:.2f}** | **{cache}** | **{mean_a:.2f}** | **{_pct(mean_t, mean_a)}** | **{mean_it}** | |")
+            print(f"  {'mean ' + cache:22s} today {mean_t:>7.2f}s arena {mean_a:.2f}  d% {_pct(mean_t, mean_a)}  s/it {mean_it}", flush=True)
         lines.append("")
     summary_md = out_dir / f"repeatability_summary_{stamp}.md"
     summary_md.write_text("\n".join(lines))
@@ -367,8 +445,8 @@ def main():
               "errors": sum(1 for r in results if r["verdict"] == "ERROR"),
               "results": results}
     latest = TEST_DIR / "repeatability_report.json"
-    latest.write_text(json.dumps(report, indent=2, ensure_ascii=False))
-    (TEST_DIR / f"repeatability_report_{stamp}.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    atomic_write_json(latest, report, ensure_ascii=False)
+    atomic_write_json(TEST_DIR / f"repeatability_report_{stamp}.json", report, ensure_ascii=False)
     print(f"\n== VERDICT: {report['identical']}/{report['grid']} bit-identical | "
           f"{report['differ']} differ | {report['errors']} errors ==", flush=True)
     print(f"report: {latest}", flush=True)

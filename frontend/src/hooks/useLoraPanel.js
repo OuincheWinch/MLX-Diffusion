@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, API_BASE } from "../api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../api";
 import { findLoraEntry } from "../utils/loraUtils";
 
 export function useLoraPanel({ onError }) {
@@ -8,18 +8,41 @@ export function useLoraPanel({ onError }) {
   const [newLora, setNewLora] = useState({ name: "", path: "" });
   const [savingLora, setSavingLora] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(null);
+  const registryRequestRef = useRef(0);
+  const onErrorRef = useRef(onError);
 
   useEffect(() => {
-    api("/api/loras").then(setLoraRegistry).catch(() => {});
+    onErrorRef.current = onError;
+  }, [onError]);
+
+  const refreshLoraRegistry = useCallback(async () => {
+    const requestId = ++registryRequestRef.current;
+    try {
+      const list = await api("/api/loras");
+      if (requestId !== registryRequestRef.current) return null;
+      const normalized = Array.isArray(list) ? list : [];
+      setLoraRegistry(normalized);
+      return normalized;
+    } catch (err) {
+      if (requestId === registryRequestRef.current) onErrorRef.current?.(err.message || String(err));
+      return null;
+    }
   }, []);
+
+  useEffect(() => {
+    refreshLoraRegistry();
+    return () => {
+      registryRequestRef.current += 1;
+    };
+  }, [refreshLoraRegistry]);
 
   const activeTriggerWords = useMemo(() => {
     const words = new Set();
     for (const lora of loras) {
       const entry = findLoraEntry(lora, loraRegistry);
       if (entry?.triggers) {
-        for (const t of entry.triggers) {
-          if (t && t.trim()) words.add(t.trim());
+        for (const trigger of entry.triggers) {
+          if (typeof trigger === "string" && trigger.trim()) words.add(trigger.trim());
         }
       }
     }
@@ -34,20 +57,19 @@ export function useLoraPanel({ onError }) {
       const form = new FormData();
       form.append("file", file);
       const name = newLora.name.trim() || file.name.replace(/\.safetensors$/, "");
-      const res = await fetch(
-        `${API_BASE}/api/loras/upload?name=${encodeURIComponent(name)}`,
-        { method: "POST", body: form }
-      );
-      if (!res.ok) throw new Error((await res.json()).detail || "upload failed");
-      const entry = await res.json();
-      setLoraRegistry([
-        ...loraRegistry.filter((l) => l.name !== entry.name && l.path !== entry.path),
+      const entry = await api(`/api/loras/upload?name=${encodeURIComponent(name)}`, {
+        method: "POST",
+        body: form,
+      });
+      setLoraRegistry((previous) => [
+        ...previous.filter((item) => item.name !== entry.name && item.path !== entry.path),
         entry,
       ]);
+      await refreshLoraRegistry();
       setNewLora({ name: "", path: "" });
       setUploadProgress(`Registered "${entry.name}" — pick it from the dropdown.`);
-    } catch (e) {
-      onError?.(String(e.message || e));
+    } catch (err) {
+      onErrorRef.current?.(`LoRA upload failed: ${err.message || err}`);
       setUploadProgress(null);
     } finally {
       setSavingLora(false);
@@ -60,12 +82,19 @@ export function useLoraPanel({ onError }) {
     try {
       const entry = await api("/api/loras", {
         method: "POST",
-        body: JSON.stringify(newLora),
+        body: JSON.stringify({
+          name: newLora.name.trim(),
+          path: newLora.path.trim(),
+        }),
       });
-      setLoraRegistry([...loraRegistry, entry]);
+      setLoraRegistry((previous) => [
+        ...previous.filter((item) => item.name !== entry.name && item.path !== entry.path),
+        entry,
+      ]);
+      await refreshLoraRegistry();
       setNewLora({ name: "", path: "" });
-    } catch (e) {
-      onError?.(String(e.message || e));
+    } catch (err) {
+      onErrorRef.current?.(err.message || String(err));
     } finally {
       setSavingLora(false);
     }
@@ -76,6 +105,7 @@ export function useLoraPanel({ onError }) {
     setLoras,
     loraRegistry,
     setLoraRegistry,
+    refreshLoraRegistry,
     newLora,
     setNewLora,
     savingLora,

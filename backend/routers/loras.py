@@ -1,9 +1,13 @@
 from pathlib import Path
+import json
+import re
+
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import generator
 import app_settings
+import civitai_service
 from state import (
     LORA_FILES_DIR,
     SDXL_LORA_DIR,
@@ -13,60 +17,175 @@ from state import (
     _validate_lora_path,
     _inspect_safetensors,
     sync_lora_entry_with_civitai,
+    _upsert_lora_entries,
+    _remove_lora_entries,
+    JOBS,
+    _JOBS_LOCK,
 )
 
 router = APIRouter(tags=["loras"])
+_BASE_MODELS = {"sdxl", "flux2", "krea2", "z-image"}
+
+
+def _has_incomplete_files(path: Path) -> bool:
+    try:
+        return any(
+            candidate.name.endswith((".incomplete", ".part"))
+            for candidate in path.rglob("*")
+            if candidate.is_file() and ".cache" not in candidate.relative_to(path).parts
+        )
+    except (OSError, ValueError):
+        return True
+
+
+def _complete_weight_directory(path: Path) -> bool:
+    if not path.is_dir() or _has_incomplete_files(path):
+        return False
+    index_files = list(path.rglob("*.safetensors.index.json"))
+    if index_files:
+        for index_file in index_files:
+            try:
+                data = json.loads(index_file.read_text("utf-8"))
+                weight_map = data.get("weight_map") if isinstance(data, dict) else None
+                if not isinstance(weight_map, dict) or not weight_map:
+                    return False
+                if any(not (index_file.parent / str(filename)).is_file() for filename in weight_map.values()):
+                    return False
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return False
+        return True
+    return any(path.rglob("*.safetensors"))
+
+
+def _complete_sdxl_directory(path: Path) -> bool:
+    model_index = path / "model_index.json"
+    if not model_index.is_file() or _has_incomplete_files(path):
+        return False
+    try:
+        data = json.loads(model_index.read_text("utf-8"))
+        components = [
+            key
+            for key, value in data.items()
+            if isinstance(value, list)
+            and len(value) >= 2
+            and isinstance(value[0], str)
+            and isinstance(value[1], str)
+        ]
+        if not components:
+            return False
+        for component in components:
+            if not (path / component).is_dir():
+                return False
+        return _complete_weight_directory(path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+
+
+def _complete_hf_snapshot(repo: str) -> bool:
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{repo.replace('/', '--')}"
+    snapshots = cache_dir / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    try:
+        candidates = sorted((path for path in snapshots.iterdir() if path.is_dir()), key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return False
+    for candidate in candidates:
+        try:
+            if _complete_weight_directory(candidate) and any(candidate.rglob("*.json")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _model_is_fully_cached(model_id: str, minfo: dict | None = None, local_path: Path | None = None) -> bool:
+    minfo = minfo or generator.get_model_info(model_id)
+    if not minfo:
+        return False
+    local = local_path or generator.resolve_local_model_path(model_id)
+    if local is not None:
+        if minfo.get("engine") == "sdxl":
+            return _complete_sdxl_directory(local)
+        try:
+            return not _has_incomplete_files(local) and any(local.rglob("*.safetensors"))
+        except OSError:
+            return False
+    if minfo.get("engine") == "sdxl":
+        model_dir = minfo.get("model_dir")
+        return bool(model_dir and _complete_sdxl_directory(Path(model_dir)))
+    if model_id == "krea2-turbo":
+        path = generator.ASSET_DIR / "models" / "krea2-turbo-q4"
+        try:
+            return path.is_dir() and not _has_incomplete_files(path) and any(path.rglob("*.safetensors"))
+        except OSError:
+            return False
+    repo = generator.model_download_repo(model_id, minfo) or ""
+    return "/" in repo and _complete_hf_snapshot(repo)
 
 
 @router.get("/api/models")
 def list_models():
     items = []
-    for m in generator.MODELS.values():
-        entry = app_settings.apply_model_defaults(m["id"], m)
-        entry["installed"] = generator.is_model_cached(m["id"])
-        entry["download_repo"] = generator.model_download_repo(m["id"], m)
-        entry["disk_usage_bytes"] = generator.model_disk_usage(m["id"], m)
+    for model in generator.MODELS.values():
+        entry = app_settings.apply_model_defaults(model["id"], model)
+        entry["local_path_configured"] = bool(app_settings.configured_model_local_path(model["id"]))
+        installed = _model_is_fully_cached(model["id"], model)
+        entry["installed"] = installed
+        if not installed:
+            entry.pop("local_path", None)
+        entry["download_repo"] = generator.model_download_repo(model["id"], model)
+        entry["disk_usage_bytes"] = generator.model_disk_usage(model["id"], model)
         items.append(entry)
     return items
 
 
 @router.delete("/api/models/{model_id}")
 def remove_model(model_id: str):
-    """Remove a model's weights from disk (SDXL local dir / HF hub cache / krea2 bundle)."""
     if model_id not in generator.MODELS:
         raise HTTPException(404, "unknown model")
     ok, reason = generator.uninstall_model(model_id)
     if not ok:
         raise HTTPException(409, reason or "model is in use")
-    return {"status": "removed", "model_id": model_id}
+    return {"status": "unlinked" if reason and "unlinked" in reason else "removed", "model_id": model_id}
 
 
 class LocalInstallRequest(BaseModel):
-    model_id: str
-    path: str
+    model_config = ConfigDict(extra="forbid")
+    model_id: str = Field(min_length=1, max_length=120)
+    path: str = Field(min_length=1, max_length=4096)
 
 
 @router.get("/api/models/local-sources")
 def list_local_sources(model_id: str | None = None):
-    """Already-downloaded weight locations (HF hub cache snapshots) the user can
-    install from instead of re-downloading."""
+    if model_id is not None and model_id not in generator.MODELS:
+        raise HTTPException(404, "unknown model")
     return {"sources": generator.list_local_model_sources(model_id)}
 
 
 @router.post("/api/models/install-local")
 def install_local_model(req: LocalInstallRequest):
-    """Register an existing on-disk folder (or HF cache snapshot) as a model's
-    weights. Nothing is copied: the model loads directly from this path."""
     if req.model_id not in generator.MODELS:
         raise HTTPException(404, "unknown model")
+    try:
+        expanded_path = Path(req.path).expanduser()
+    except (OSError, RuntimeError) as e:
+        raise HTTPException(400, "invalid model path") from e
+    if "\x00" in req.path or not expanded_path.is_absolute():
+        raise HTTPException(400, "model path must be absolute")
     ok, reason = generator.validate_local_model_dir(req.model_id, req.path)
     if not ok:
         raise HTTPException(400, reason or "invalid model directory")
     resolved = generator.resolve_local_model_path(req.model_id, req.path)
-    if resolved is None:
+    if resolved is None or not resolved.is_dir():
         raise HTTPException(400, "path does not exist")
-    app_settings.update_settings({"model_paths": {req.model_id: str(resolved)}})
-    return {"status": "installed", "model_id": req.model_id, "local_path": str(resolved)}
+    if not _model_is_fully_cached(req.model_id, generator.MODELS[req.model_id], resolved):
+        raise HTTPException(400, "model directory is incomplete")
+    try:
+        app_settings.update_settings({"model_paths": {req.model_id: str(resolved.resolve())}})
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"status": "installed", "model_id": req.model_id, "local_path": str(resolved.resolve())}
 
 
 @router.get("/api/loras")
@@ -76,76 +195,112 @@ def list_loras():
 
 @router.post("/api/loras/sync-civitai")
 def sync_all_loras_civitai():
-    """Scan and synchronize all registered LoRAs with Civitai API."""
-    with _loras_lock:
-        loras = _read_loras()
-        updated = 0
-        for l in loras:
-            if sync_lora_entry_with_civitai(l, force=False):
-                updated += 1
-        if updated > 0:
-            _write_loras(loras)
-        return {
-            "status": "ok",
-            "total": len(loras),
-            "updated": updated,
-            "loras": loras,
-        }
+    snapshot = _read_loras()
+    updates = []
+    for entry in snapshot:
+        candidate = dict(entry)
+        if sync_lora_entry_with_civitai(candidate, force=False):
+            updates.append(candidate)
+    if updates:
+        with _loras_lock:
+            current = _read_loras()
+            current_keys = {(entry.get("name"), entry.get("path")) for entry in current}
+            changed = 0
+            for update in updates:
+                key = (update.get("name"), update.get("path"))
+                if key not in current_keys:
+                    continue
+                for index, entry in enumerate(current):
+                    if (entry.get("name"), entry.get("path")) == key:
+                        current[index] = {**entry, **update}
+                        changed += 1
+                        break
+            if changed:
+                _write_loras(current)
+    return {"status": "ok", "total": len(snapshot), "updated": len(updates), "loras": _read_loras()}
 
 
 class LoRASaveRequest(BaseModel):
-    name: str
-    path: str
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    name: str = Field(min_length=1, max_length=200)
+    path: str = Field(min_length=1, max_length=4096)
     scale: float = Field(default=1.0, ge=0.0, le=10.0)
-    base_model: str | None = None
-    triggers: list[str] = []
-    sha256: str | None = None
+    base_model: str | None = Field(default=None, max_length=32)
+    triggers: list[str] = Field(default_factory=list, max_length=16)
+    sha256: str | None = Field(default=None, min_length=64, max_length=64, pattern=r"^[A-Fa-f0-9]{64}$")
 
 
 @router.post("/api/loras")
 def save_lora(req: LoRASaveRequest):
+    name = req.name.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,199}", name):
+        raise HTTPException(400, "invalid LoRA name")
+    path = Path(req.path).expanduser()
+    if not path.is_absolute():
+        raise HTTPException(400, "registered LoRA path must be absolute")
     err = _validate_lora_path(req.path)
     if err:
         raise HTTPException(400, err)
+    if req.base_model is not None and req.base_model not in _BASE_MODELS:
+        raise HTTPException(400, "invalid base model")
+    if any(not isinstance(trigger, str) or not trigger.strip() or len(trigger) > 200 or any(ord(char) < 32 or ord(char) == 127 for char in trigger) for trigger in req.triggers):
+        raise HTTPException(400, "invalid LoRA trigger")
     loras = _read_loras()
-    existing = next((l for l in loras if l.get("name") == req.name or l.get("path") == req.path), {})
-    entry = {**existing, **req.model_dump(exclude_unset=True)}
-    p = Path(req.path).expanduser()
-    if p.is_file() and (not entry.get("base_model") or not entry.get("triggers")):
-        detected_base, detected_triggers = _inspect_safetensors(p)
-        if not entry.get("base_model"):
-            entry["base_model"] = detected_base
-        if not entry.get("triggers"):
-            entry["triggers"] = detected_triggers
+    existing = next((entry for entry in loras if entry.get("name") == name or entry.get("path") == req.path), {})
+    entry_data = req.model_dump(exclude_unset=True)
+    entry_data["name"] = name
+    entry = {**existing, **entry_data}
+    detected_base, detected_triggers = _inspect_safetensors(path)
+    if not entry.get("base_model") and detected_base:
+        entry["base_model"] = detected_base
     entry.setdefault("base_model", "sdxl" if "sdxl" in req.path.lower() else "flux2")
+    if not entry.get("triggers") and detected_triggers:
+        entry["triggers"] = detected_triggers
     entry.setdefault("triggers", [])
+    actual_sha256 = civitai_service.compute_file_sha256(path)
+    if req.sha256 and req.sha256.upper() != actual_sha256:
+        raise HTTPException(400, "LoRA SHA-256 does not match the file")
+    entry["sha256"] = actual_sha256
     sync_lora_entry_with_civitai(entry)
-    loras = [l for l in loras if l["name"] != req.name and l["path"] != req.path]
-    loras.append(entry)
-    _write_loras(loras)
+    _upsert_lora_entries([entry])
     return entry
 
 
 @router.delete("/api/loras/{name}")
 def delete_lora(name: str):
+    if not isinstance(name, str) or not name.strip() or len(name) > 200:
+        raise HTTPException(400, "invalid LoRA name")
+    name = name.strip()
     with _loras_lock:
         loras = _read_loras()
-        target = next((l for l in loras if l["name"] == name), None)
+        target = next((entry for entry in loras if entry.get("name") == name), None)
         if not target:
             raise HTTPException(404, "not found")
-        remaining = [l for l in loras if l["name"] != name]
-        _write_loras(remaining)
-
-        # Physical file removal if located inside local application folders
         raw_path = target.get("path", "")
-        if raw_path:
-            p = Path(raw_path).expanduser().resolve()
-            if p.exists() and (
-                p.is_relative_to(LORA_FILES_DIR.resolve())
-                or p.is_relative_to(SDXL_LORA_DIR.resolve())
-            ):
+        path = Path(raw_path).expanduser().resolve() if raw_path else None
+        if path is not None:
+            with _JOBS_LOCK:
+                for job in JOBS.values():
+                    if job.get("status") not in ("queued", "generating"):
+                        continue
+                    request = job.get("request")
+                    active_loras = getattr(request, "loras", []) if request is not None else []
+                    for lora in active_loras:
+                        active_path = lora.get("path") if isinstance(lora, dict) else getattr(lora, "path", "")
+                        if active_path and Path(str(active_path)).expanduser().resolve() == path:
+                            raise HTTPException(409, "LoRA is used by an active generation")
+        _remove_lora_entries(names={name})
+        if path is not None:
+            generator._drop_mflux_pipeline()
+            generator._kill_sdxl_daemon()
+            roots = (LORA_FILES_DIR.resolve(), SDXL_LORA_DIR.resolve())
+            if any(path.is_relative_to(root) for root in roots) and path.exists() and path.is_file():
                 try:
-                    p.unlink()
-                except OSError:
-                    pass
-        return {"deleted": name}
+                    path.unlink()
+                except OSError as e:
+                    try:
+                        _upsert_lora_entries([target])
+                    except Exception:
+                        pass
+                    raise HTTPException(500, "LoRA file could not be deleted") from e
+    return {"deleted": name}

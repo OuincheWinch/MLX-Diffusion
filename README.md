@@ -1,6 +1,6 @@
 # MLX-Diffusion
 
-**Beta — v0.1.1**
+**Beta — v0.1.2**
 
 ![MLX-DIFFUSION on MacBook Pro](frontend/src/assets/MLX-DIFFUSION_ON_MBP.png)
 

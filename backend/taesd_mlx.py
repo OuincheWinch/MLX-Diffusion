@@ -1,6 +1,7 @@
 """Pure MLX implementation of TAESD (Tiny AutoEncoder for SDXL) by Ollin Boer Bohan.
 Runs in ~0.5s on Apple Silicon Metal with zero PyTorch runtime dependency.
 """
+import gc
 from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
@@ -52,6 +53,7 @@ import threading
 
 _CACHED_TAESD = None
 _COMPILED_TAESD = None
+_CACHED_TAESD_PATH = None
 _TAESD_LOCK = threading.Lock()
 
 _TAESD_PT_TO_MLX_MAP = {
@@ -94,13 +96,18 @@ _TAESD_PT_TO_MLX_MAP = {
 
 
 def get_taesd_decoder(model_path: str | Path | None = None) -> callable:
-    global _CACHED_TAESD, _COMPILED_TAESD
+    global _CACHED_TAESD, _COMPILED_TAESD, _CACHED_TAESD_PATH
     with _TAESD_LOCK:
-        if _COMPILED_TAESD is not None:
-            return _COMPILED_TAESD
         if model_path is None:
             model_path = Path(__file__).parent / "data" / "models" / "taesdxl" / "diffusion_pytorch_model.safetensors"
-        model_path = Path(model_path).resolve()
+        model_path = Path(model_path).expanduser().resolve()
+        if _COMPILED_TAESD is not None and _CACHED_TAESD_PATH == model_path:
+            return _COMPILED_TAESD
+        if _COMPILED_TAESD is not None:
+            _CACHED_TAESD = None
+            _COMPILED_TAESD = None
+            _CACHED_TAESD_PATH = None
+            gc.collect()
         if not model_path.exists():
             raise FileNotFoundError(f"TAESD model weights not found at {model_path}")
 
@@ -133,4 +140,18 @@ def get_taesd_decoder(model_path: str | Path | None = None) -> callable:
         update_module(model, tree)
         _CACHED_TAESD = model
         _COMPILED_TAESD = mx.compile(model)
+        _CACHED_TAESD_PATH = model_path
         return _COMPILED_TAESD
+
+
+def clear_taesd_cache():
+    global _CACHED_TAESD, _COMPILED_TAESD, _CACHED_TAESD_PATH
+    with _TAESD_LOCK:
+        _CACHED_TAESD = None
+        _COMPILED_TAESD = None
+        _CACHED_TAESD_PATH = None
+    gc.collect()
+    try:
+        mx.clear_cache()
+    except Exception:
+        pass

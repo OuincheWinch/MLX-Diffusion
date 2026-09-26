@@ -6,11 +6,27 @@ and rejects unknown/invalid keys so the rest of the app can trust the shape.
 """
 
 import json
+import math
 import os
+import re
+import tempfile
 import threading
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+
+
+def _resolve_asset_dir() -> Path:
+    configured = os.environ.get("MLX_DIFFUSION_ASSET_DIR", "").strip()
+    if not configured:
+        return DATA_DIR
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise ValueError("MLX_DIFFUSION_ASSET_DIR must be an absolute path")
+    return path.resolve()
+
+
+ASSET_DIR = _resolve_asset_dir()
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
 _lock = threading.RLock()
@@ -22,6 +38,9 @@ _SAMPLERS = {
     "euler_a",
     "euler",
     "ddim",
+    "linear",
+    "er_sde",
+    "flow_match_euler_discrete",
 }
 
 DEFAULTS = {
@@ -51,6 +70,7 @@ DEFAULTS = {
         "sdxl": "",
         "krea2": "",
         "z-image-turbo": "",
+        "qwen": "",
     },
     # Same, but for the structured JSON output mode (independent override).
     "prompt_enhancer_json": {
@@ -58,6 +78,7 @@ DEFAULTS = {
         "sdxl": "",
         "krea2": "",
         "z-image-turbo": "",
+        "qwen": "",
     },
     # Engine runtime tuning (None = fall back to env var / built-in default).
     # GB wired limits for the Metal allocator; 0 = unbounded (env MLX_WIRED_LIMIT_GB,
@@ -70,17 +91,42 @@ DEFAULTS = {
 }
 
 # Engine keys used by prompt_enhancer.ENGINE_PROFILES.
-PROMPT_ENHANCER_KEYS = {"flux2", "sdxl", "krea2", "z-image-turbo"}
+PROMPT_ENHANCER_KEYS = {"flux2", "sdxl", "krea2", "z-image-turbo", "qwen"}
 _PROMPT_ENHANCER_MAX = 8000
+_MAX_SETTINGS_BYTES = 8 * 1024 * 1024
+_MAX_MODEL_SETTINGS = 64
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _valid_model_id(model_id) -> bool:
+    return isinstance(model_id, str) and _MODEL_ID_RE.fullmatch(model_id) and ".." not in model_id
+
+
+def _valid_model_path(value) -> bool:
+    if not isinstance(value, str) or not 0 < len(value) <= 4096 or "\x00" in value:
+        return False
+    try:
+        return Path(value).expanduser().is_absolute()
+    except (OSError, RuntimeError):
+        return False
+
 
 _MODEL_DEFAULT_KEYS = {
-    "steps": lambda v: isinstance(v, int) and 1 <= v <= 50,
-    "guidance": lambda v: isinstance(v, (int, float)) and 0.0 <= v <= 30.0,
+    "steps": lambda v: _is_int(v) and 1 <= v <= 50,
+    "guidance": lambda v: _is_number(v) and 0.0 <= v <= 30.0,
     "sampler": lambda v: isinstance(v, str) and (not v or v in _SAMPLERS),
-    "cache_interval": lambda v: isinstance(v, int) and 1 <= v <= 10,
+    "cache_interval": lambda v: _is_int(v) and 1 <= v <= 10,
     "fast_vae": lambda v: isinstance(v, bool),
-    "width": lambda v: isinstance(v, int) and 256 <= v <= 4096,
-    "height": lambda v: isinstance(v, int) and 256 <= v <= 4096,
+    "width": lambda v: _is_int(v) and 256 <= v <= 4096,
+    "height": lambda v: _is_int(v) and 256 <= v <= 4096,
 }
 
 _VALIDATORS = {
@@ -89,15 +135,15 @@ _VALIDATORS = {
     "default_stealth": lambda v: isinstance(v, bool),
     "default_fast_vae": lambda v: isinstance(v, bool),
     "default_sampler": lambda v: isinstance(v, str) and (not v or v in _SAMPLERS),
-    "default_cache_interval": lambda v: isinstance(v, int) and 1 <= v <= 10,
-    "model_defaults": lambda v: isinstance(v, dict),
-    "model_paths": lambda v: isinstance(v, dict),
-    "prompt_enhancer": lambda v: isinstance(v, dict),
-    "prompt_enhancer_json": lambda v: isinstance(v, dict),
-    "memory_wired_limit_gb": lambda v: v is None or (isinstance(v, (int, float)) and 0 <= v <= 128),
-    "memory_krea_wired_limit_gb": lambda v: v is None or (isinstance(v, (int, float)) and 0 <= v <= 128),
-    "idle_kill_s_mflux": lambda v: v is None or (isinstance(v, int) and 0 <= v <= 86400),
-    "idle_kill_s_sdxl": lambda v: v is None or (isinstance(v, int) and 0 <= v <= 86400),
+    "default_cache_interval": lambda v: _is_int(v) and 1 <= v <= 10,
+    "model_defaults": lambda v: isinstance(v, dict) and len(v) <= _MAX_MODEL_SETTINGS,
+    "model_paths": lambda v: isinstance(v, dict) and len(v) <= _MAX_MODEL_SETTINGS,
+    "prompt_enhancer": lambda v: isinstance(v, dict) and len(v) <= len(PROMPT_ENHANCER_KEYS),
+    "prompt_enhancer_json": lambda v: isinstance(v, dict) and len(v) <= len(PROMPT_ENHANCER_KEYS),
+    "memory_wired_limit_gb": lambda v: v is None or (_is_number(v) and 0 <= v <= 128),
+    "memory_krea_wired_limit_gb": lambda v: v is None or (_is_number(v) and 0 <= v <= 128),
+    "idle_kill_s_mflux": lambda v: v is None or (_is_int(v) and 0 <= v <= 86400),
+    "idle_kill_s_sdxl": lambda v: v is None or (_is_int(v) and 0 <= v <= 86400),
 }
 
 
@@ -112,24 +158,81 @@ def _deep_merge(base: dict, updates: dict) -> dict:
 
 
 def _load() -> dict:
-    # Deep copy so callers (update_settings) can mutate nested dicts without
-    # corrupting the module-level DEFAULTS template.
     settings = json.loads(json.dumps(DEFAULTS))
     try:
-        if SETTINGS_FILE.exists():
-            raw = json.loads(SETTINGS_FILE.read_text("utf-8"))
-            if isinstance(raw, dict):
-                settings = _deep_merge(settings, raw)
-    except Exception as e:
+        raw = (
+            json.loads(SETTINGS_FILE.read_text("utf-8"))
+            if SETTINGS_FILE.exists()
+            and SETTINGS_FILE.resolve().is_relative_to(DATA_DIR.resolve())
+            and SETTINGS_FILE.stat().st_size <= _MAX_SETTINGS_BYTES
+            else {}
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
         print(f"[settings] failed to load {SETTINGS_FILE}: {e}", flush=True)
+        return settings
+    if not isinstance(raw, dict):
+        return settings
+    for key, validator in _VALIDATORS.items():
+        if key not in raw or not validator(raw[key]):
+            continue
+        value = raw[key]
+        if key == "model_defaults" and isinstance(value, dict):
+            clean = {}
+            for model_id, overrides in value.items():
+                if not _valid_model_id(model_id) or not isinstance(overrides, dict):
+                    continue
+                valid_overrides = {k: v for k, v in overrides.items() if k in _MODEL_DEFAULT_KEYS and _MODEL_DEFAULT_KEYS[k](v)}
+                if valid_overrides:
+                    clean[model_id] = valid_overrides
+            settings[key] = clean
+        elif key == "model_paths" and isinstance(value, dict):
+            settings[key] = {model_id: path for model_id, path in value.items() if _valid_model_id(model_id) and _valid_model_path(path)}
+        elif key in ("prompt_enhancer", "prompt_enhancer_json") and isinstance(value, dict):
+            clean_prompts = dict(settings[key])
+            clean_prompts.update({
+                key_name: text
+                for key_name, text in value.items()
+                if key_name in PROMPT_ENHANCER_KEYS and isinstance(text, str) and len(text) <= _PROMPT_ENHANCER_MAX
+            })
+            settings[key] = clean_prompts
+        else:
+            settings[key] = value
     return settings
 
 
 def _save(settings: dict):
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SETTINGS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(settings, indent=2), "utf-8")
-    os.replace(tmp, SETTINGS_FILE)
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(SETTINGS_FILE.parent, 0o700)
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=str(SETTINGS_FILE.parent), prefix=".settings-", suffix=".tmp")
+    try:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            try:
+                fchmod(fd, 0o600)
+            except OSError:
+                pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SETTINGS_FILE)
+        try:
+            dir_fd = os.open(str(SETTINGS_FILE.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def get_settings() -> dict:
@@ -178,7 +281,7 @@ def update_settings(updates: dict) -> dict:
                 continue
             if key == "model_defaults":
                 for model_id, overrides in value.items():
-                    if not isinstance(model_id, str) or len(model_id) > 120:
+                    if not _valid_model_id(model_id):
                         errors.append(f"model_defaults: invalid model id '{model_id}'")
                         continue
                     if not isinstance(overrides, dict):
@@ -213,17 +316,23 @@ def update_settings(updates: dict) -> dict:
 
             if key == "model_paths":
                 for model_id, path in value.items():
-                    if not isinstance(model_id, str) or len(model_id) > 120:
+                    if not _valid_model_id(model_id):
                         errors.append(f"model_paths: invalid model id '{model_id}'")
                         continue
-                    if not path:
-                        # Empty/None -> unlink the local path for this model.
+                    if path is None or path == "":
                         current.setdefault("model_paths", {}).pop(model_id, None)
                         continue
-                    if not isinstance(path, str) or len(path) > 4096:
-                        errors.append(f"model_paths.{model_id}: invalid path")
+                    if not _valid_model_path(path):
+                        errors.append(f"model_paths.{model_id}: path must be absolute")
                         continue
                     current.setdefault("model_paths", {})[model_id] = path
+
+        if errors:
+            raise ValueError("; ".join(errors))
+
+        for key in ("model_defaults", "model_paths"):
+            if len(current.get(key, {})) > _MAX_MODEL_SETTINGS:
+                errors.append(f"{key}: too many entries")
 
         if errors:
             raise ValueError("; ".join(errors))
@@ -242,6 +351,8 @@ def update_settings(updates: dict) -> dict:
 
 
 def clear_model_defaults(model_id: str) -> dict:
+    if not _valid_model_id(model_id):
+        raise ValueError("invalid model id")
     with _lock:
         current = _load()
         current.get("model_defaults", {}).pop(model_id, None)
@@ -261,7 +372,18 @@ def prompt_enhancer_json_override(engine_key: str) -> str:
 
 def model_local_path(model_id: str) -> str:
     """User-registered local weights directory for a model, or ""."""
-    return (get_settings().get("model_paths") or {}).get(model_id, "") or ""
+    path = (get_settings().get("model_paths") or {}).get(model_id, "") or ""
+    if not _valid_model_path(path):
+        return ""
+    resolved = Path(path).expanduser()
+    return str(resolved) if resolved.is_dir() else ""
+
+
+def configured_model_local_path(model_id: str) -> str:
+    path = (get_settings().get("model_paths") or {}).get(model_id, "") or ""
+    if not _valid_model_path(path):
+        return ""
+    return str(Path(path).expanduser())
 
 
 # Keys a model descriptor may carry natively vs which come from settings overrides.
@@ -301,9 +423,11 @@ def apply_model_defaults(model_id: str, model: dict) -> dict:
         merged["default_cache_interval"] = get_settings().get("default_cache_interval", 1)
     if "default_fast_vae" not in merged:
         merged["default_fast_vae"] = get_settings().get("default_fast_vae", True)
+    if not model.get("supports_fast_vae", True):
+        merged["default_fast_vae"] = False
     if "default_output_format" not in merged:
         merged["default_output_format"] = get_settings().get("default_output_format", "png")
-    local_path = (get_settings().get("model_paths") or {}).get(model_id) or ""
+    local_path = model_local_path(model_id)
     if local_path:
         merged["local_path"] = local_path
     return merged

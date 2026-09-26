@@ -81,20 +81,7 @@ export default function QueueRecoveryDrawer({
     const req = item.request || {};
     window.dispatchEvent(
       new CustomEvent("mlx:load-prompt", {
-        detail: {
-          prompt: req.prompt || "",
-          negative_prompt: req.negative_prompt || "",
-          model: req.model || "",
-          seed: req.seed,
-          width: req.width,
-          height: req.height,
-          steps: req.steps,
-          guidance: req.guidance,
-          batch: req.batch || 1,
-          sampler: req.sampler,
-          fast_vae: req.fast_vae,
-          loras: req.loras || [],
-        },
+        detail: { ...req },
       })
     );
     onClose();
@@ -146,7 +133,7 @@ export default function QueueRecoveryDrawer({
               {items.length} {items.length > 1 ? "prompts" : "prompt"}
             </span>
           </div>
-          <button className="btn-close" onClick={onClose} title="Fermer">
+          <button type="button" className="btn-close" onClick={onClose} title="Fermer">
             ✕
           </button>
         </div>
@@ -158,6 +145,7 @@ export default function QueueRecoveryDrawer({
         {items.length > 0 && (
           <div className="queue-recovery-bulk-actions">
             <button
+              type="button"
               className="btn-primary btn-restore-all"
               onClick={handleRestoreAll}
               disabled={restoring}
@@ -165,18 +153,21 @@ export default function QueueRecoveryDrawer({
               ↺ Tout réinsérer dans la file ({items.length})
             </button>
             <button
+              type="button"
               className="btn-secondary"
               onClick={handleCopyAllPrompts}
             >
               {copiedAll ? "✓ Copiés !" : "⎘ Copier tous les prompts"}
             </button>
             <button
+              type="button"
               className="btn-danger-ghost"
               onClick={handleClearAll}
             >
               🗑 Tout effacer
             </button>
             <button
+              type="button"
               className="btn-danger"
               onClick={handleClearAndForget}
               title="Efface aussi la file en attente : rien ne sera restauré au prochain démarrage"
@@ -241,6 +232,7 @@ export default function QueueRecoveryDrawer({
 
                   <div className="queue-recovery-item-actions">
                     <button
+                      type="button"
                       className="btn-mini btn-action-requeue"
                       onClick={() => handleRestoreSingle(it.id)}
                       disabled={restoring}
@@ -249,6 +241,7 @@ export default function QueueRecoveryDrawer({
                       ↺ Réinsérer
                     </button>
                     <button
+                      type="button"
                       className="btn-mini"
                       onClick={() => handleLoadInForm(it)}
                       title="Charger ce prompt et ses réglages dans le formulaire"
@@ -256,6 +249,7 @@ export default function QueueRecoveryDrawer({
                       ✎ Charger
                     </button>
                     <button
+                      type="button"
                       className="btn-mini"
                       onClick={() => handleCopyPrompt(it)}
                       title="Copier le texte du prompt"
@@ -263,6 +257,7 @@ export default function QueueRecoveryDrawer({
                       {copiedId === it.id ? "✓ Copié" : "⎘ Copier"}
                     </button>
                     <button
+                      type="button"
                       className="btn-mini btn-item-delete"
                       onClick={() => handleDeleteSingle(it.id)}
                       title="Supprimer définitivement ce prompt de la liste de récupération"

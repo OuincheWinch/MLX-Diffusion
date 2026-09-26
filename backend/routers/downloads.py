@@ -1,158 +1,215 @@
+import hashlib
 import os
 import re
 import tempfile
 import threading
 import time
 import uuid
+from email.message import Message
 from pathlib import Path
-from urllib.parse import urlparse
-import requests
+from typing import Literal
+from urllib.parse import unquote, urlsplit, urlunsplit
+
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from huggingface_hub import HfApi
+from pydantic import BaseModel, ConfigDict, Field
 
 import civitai_service
 import generator
 import hf_service
-from huggingface_hub import HfApi, hf_hub_download
+from .loras import _model_is_fully_cached
 from state import (
-    DATA_DIR,
     LORA_FILES_DIR,
     SDXL_LORA_DIR,
     DOWNLOAD_TASKS,
     _DOWNLOAD_LOCK,
     MODEL_DOWNLOAD_TASKS,
     _MODEL_DOWNLOAD_LOCK,
-    _loras_lock,
-    _read_loras,
-    _write_loras,
+    MAX_LORA_UPLOAD_BYTES,
     _inspect_safetensors,
+    _read_loras,
+    _remove_lora_entries,
+    _sanitize_filename,
+    _upsert_lora_entries,
 )
 
 router = APIRouter(tags=["downloads"])
+_BASE_MODELS = {"sdxl", "flux2", "krea2", "z-image"}
+_CIVITAI_HOSTS = {"civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"}
 
 
 class CivitaiImportRequest(BaseModel):
-    url_or_id: str
-    name: str | None = None
-    api_key: str | None = None
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    url_or_id: str = Field(min_length=1, max_length=8192)
+    name: str | None = Field(default=None, max_length=200)
+    api_key: str | None = Field(default=None, max_length=8192)
 
 
 class HFImportRequest(BaseModel):
-    url_or_repo: str
-    name: str | None = None
-    token: str | None = None
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    url_or_repo: str = Field(min_length=1, max_length=4096)
+    name: str | None = Field(default=None, max_length=200)
+    token: str | None = Field(default=None, max_length=8192)
 
 
 class DirectUrlImportRequest(BaseModel):
-    url: str
-    name: str | None = None
-    triggers: list[str] | None = None
-    base_model: str | None = None
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    url: str = Field(min_length=1, max_length=8192)
+    name: str | None = Field(default=None, max_length=200)
+    triggers: list[str] | None = Field(default=None, max_length=16)
+    base_model: Literal["sdxl", "flux2", "krea2", "z-image"] | None = None
 
 
 class UnifiedDownloadRequest(BaseModel):
-    url_or_id: str
-    name: str | None = None
-    token: str | None = None
-    api_key: str | None = None
-    triggers: list[str] | None = None
-    base_model: str | None = None
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    url_or_id: str = Field(min_length=1, max_length=8192)
+    name: str | None = Field(default=None, max_length=200)
+    token: str | None = Field(default=None, max_length=8192)
+    api_key: str | None = Field(default=None, max_length=8192)
+    triggers: list[str] | None = Field(default=None, max_length=16)
+    base_model: Literal["sdxl", "flux2", "krea2", "z-image"] | None = None
 
 
 def make_download_progress_cb(task_id: str):
-    def on_progress(pdata):
+    def on_progress(progress_data):
         with _DOWNLOAD_LOCK:
-            t = DOWNLOAD_TASKS.get(task_id)
-            if not t or t["status"] in ("cancelled", "error"):
+            task = DOWNLOAD_TASKS.get(task_id)
+            if not task or task.get("status") != "downloading":
                 return
-            if isinstance(pdata, dict):
-                t["status_text"] = pdata.get("status", t["status_text"])
-                t["progress"] = pdata.get("progress", t["progress"])
-                t["downloaded_bytes"] = pdata.get("downloaded_bytes", t["downloaded_bytes"])
-                t["total_bytes"] = pdata.get("total_bytes", t["total_bytes"])
-                t["speed_mb_s"] = pdata.get("speed_mb_s", t["speed_mb_s"])
+            if isinstance(progress_data, dict):
+                task["status_text"] = str(progress_data.get("status", task.get("status_text", "")))[:500]
+                for key in ("progress", "downloaded_bytes", "total_bytes", "speed_mb_s"):
+                    if key in progress_data:
+                        task[key] = progress_data[key]
             else:
-                t["status_text"] = str(pdata)
+                task["status_text"] = str(progress_data)[:500]
     return on_progress
 
 
 def _fail_task(task_id: str, error: Exception | str, auth: bool = False, auth_msg: str = ""):
     with _DOWNLOAD_LOCK:
-        t = DOWNLOAD_TASKS.get(task_id)
-        if t:
-            if auth:
-                t["status"] = "error"
-                t["error"] = f"AUTH_REQUIRED: {error}"
-                t["status_text"] = auth_msg or "Authentication required"
-            else:
-                is_cancelled = "cancelled by user" in str(error).lower()
-                t["status"] = "cancelled" if is_cancelled else "error"
-                t["error"] = str(error)
-                t["status_text"] = "Download cancelled" if is_cancelled else f"Download failed: {error}"
-            t["finished_at"] = time.time()
-            t.pop("cancel_event", None)
+        task = DOWNLOAD_TASKS.get(task_id)
+        if not task:
+            return False
+        if task.get("status") != "downloading":
+            if task.get("status") == "cancelled":
+                task["worker_active"] = False
+            return False
+        message = str(error)
+        cancelled = isinstance(error, civitai_service.DownloadCancelled) or "cancelled by user" in message.lower()
+        if auth:
+            task["status"] = "error"
+            task["worker_active"] = False
+            task["error"] = f"AUTH_REQUIRED: {message}"[:2000]
+            task["status_text"] = auth_msg or "Authentication required"
+        else:
+            task["status"] = "cancelled" if cancelled else "error"
+            task["worker_active"] = False
+            task["error"] = message[:2000]
+            task["status_text"] = "Download cancelled" if cancelled else f"Download failed: {message}"[:500]
+        task["finished_at"] = time.time()
+        task.pop("cancel_event", None)
+        return True
 
 
 def _finish_task(task_id: str, entry: dict, status_text: str):
     with _DOWNLOAD_LOCK:
-        t = DOWNLOAD_TASKS.get(task_id)
-        if t:
-            t["status"] = "done"
-            t["progress"] = 1.0
-            t["finished_at"] = time.time()
-            t["status_text"] = status_text
-            t["result"] = entry
-            if "base_model" in entry:
-                t["base_model"] = entry["base_model"]
-            t.pop("cancel_event", None)
+        task = DOWNLOAD_TASKS.get(task_id)
+        if not task:
+            return False
+        if task.get("status") != "downloading":
+            if task.get("status") == "cancelled":
+                task["worker_active"] = False
+            return False
+        task["status"] = "done"
+        task["worker_active"] = False
+        task["progress"] = 1.0
+        task["finished_at"] = time.time()
+        task["status_text"] = status_text[:500]
+        task["result"] = entry
+        if "base_model" in entry:
+            task["base_model"] = entry["base_model"]
+        task.pop("cancel_event", None)
+        return True
 
 
-def _run_civitai_download(task_id: str, req: CivitaiImportRequest, meta: dict, vid: int, cancel_event: threading.Event):
-    target_dir = SDXL_LORA_DIR if meta["base_model"] == "sdxl" else LORA_FILES_DIR
-    on_progress = make_download_progress_cb(task_id)
-
+def _cleanup_registered_entry(entry: dict | None):
+    if not entry:
+        return
+    name = entry.get("name")
+    path = entry.get("path")
+    _remove_lora_entries(names={name} if isinstance(name, str) else None, paths={path} if isinstance(path, str) else None)
+    remaining_paths = {item.get("path") for item in _read_loras()}
+    if not isinstance(path, str) or path in remaining_paths:
+        return
     try:
+        resolved = Path(path).expanduser().resolve()
+        roots = (LORA_FILES_DIR.resolve(), SDXL_LORA_DIR.resolve())
+        if any(resolved.is_relative_to(root) for root in roots) and resolved.is_file():
+            resolved.unlink()
+    except OSError:
+        pass
+
+
+def _check_cancelled(cancel_event: threading.Event):
+    if cancel_event.is_set():
+        raise civitai_service.DownloadCancelled("Download cancelled by user")
+
+
+def _display_name(value: object, fallback: str) -> str:
+    text = str(value or fallback).strip()
+    text = "".join("_" if ord(char) < 32 or ord(char) == 127 or char in "/\\" else char for char in text)
+    text = text.strip()[:200] or fallback[:200]
+    return text
+
+
+def _run_civitai_download(task_id: str, req: CivitaiImportRequest, version_id: int, cancel_event: threading.Event):
+    entry = None
+    registered = False
+    try:
+        meta = civitai_service.extract_civitai_metadata(
+            civitai_service.fetch_by_version_id(version_id, api_key=req.api_key) or {}
+        )
+        target_dir = SDXL_LORA_DIR if meta["base_model"] == "sdxl" else LORA_FILES_DIR
         dest_path, enriched_meta = civitai_service.download_civitai_lora(
-            version_id=vid,
+            version_id=version_id,
             dest_dir=target_dir,
             custom_name=req.name,
             api_key=req.api_key,
-            progress_cb=on_progress,
+            progress_cb=make_download_progress_cb(task_id),
             cancel_event=cancel_event,
         )
-
-        with _loras_lock:
-            loras = _read_loras()
-            display_name = req.name or enriched_meta.get("civitai_model_name") or dest_path.stem
-            entry = {
-                "name": display_name,
-                "path": str(dest_path.resolve()),
-                "scale": 1.0,
-                "triggers": enriched_meta.get("triggers", []),
-                "base_model": enriched_meta.get("base_model", "sdxl"),
-                "sha256": enriched_meta.get("sha256"),
-                "source": "civitai",
-                "civitai_version_id": enriched_meta.get("civitai_version_id"),
-                "civitai_model_id": enriched_meta.get("civitai_model_id"),
-                "civitai_model_name": enriched_meta.get("civitai_model_name"),
-                "civitai_version_name": enriched_meta.get("civitai_version_name"),
-            }
-            loras = [l for l in loras if l["name"] != entry["name"] and l["path"] != entry["path"]]
-            loras.append(entry)
-            _write_loras(loras)
-
-        _finish_task(task_id, entry, f"Installed {entry['name']} successfully!")
-
-    except civitai_service.CivitaiAuthError as ae:
-        _fail_task(task_id, ae, auth=True, auth_msg="Authentication required")
+        _check_cancelled(cancel_event)
+        display_name = _display_name(req.name or enriched_meta.get("civitai_model_name") or dest_path.stem, "Civitai LoRA")
+        entry = {
+            "name": display_name,
+            "path": str(dest_path.resolve()),
+            "scale": 1.0,
+            "triggers": enriched_meta.get("triggers", []),
+            "base_model": enriched_meta.get("base_model", "sdxl"),
+            "sha256": enriched_meta.get("sha256"),
+            "source": "civitai",
+            "civitai_version_id": enriched_meta.get("civitai_version_id") or version_id,
+            "civitai_model_id": enriched_meta.get("civitai_model_id"),
+            "civitai_model_name": enriched_meta.get("civitai_model_name"),
+            "civitai_version_name": enriched_meta.get("civitai_version_name"),
+        }
+        _upsert_lora_entries([entry])
+        registered = True
+        if not _finish_task(task_id, entry, f"Installed {entry['name']} successfully!"):
+            _cleanup_registered_entry(entry)
+    except civitai_service.CivitaiAuthError as e:
+        _fail_task(task_id, e, auth=True, auth_msg="Authentication required")
     except Exception as e:
+        if not registered:
+            _cleanup_registered_entry(entry)
         _fail_task(task_id, e)
 
 
 def _run_hf_download(task_id: str, req: HFImportRequest, meta: dict, cancel_event: threading.Event):
     target_dir = SDXL_LORA_DIR if meta["base_model"] == "sdxl" else LORA_FILES_DIR
-    on_progress = make_download_progress_cb(task_id)
-
+    entry = None
+    registered = False
     try:
         dest_path, enriched_meta = hf_service.download_hf_lora(
             repo_id=meta["repo_id"],
@@ -161,64 +218,57 @@ def _run_hf_download(task_id: str, req: HFImportRequest, meta: dict, cancel_even
             revision=meta.get("revision", "main"),
             custom_name=req.name,
             token=req.token,
-            progress_cb=on_progress,
+            progress_cb=make_download_progress_cb(task_id),
             cancel_event=cancel_event,
         )
-
+        _check_cancelled(cancel_event)
         detected_base, detected_triggers = _inspect_safetensors(dest_path)
-        combined_triggers = list(enriched_meta.get("triggers", []))
-        for dt in detected_triggers:
-            if dt not in combined_triggers:
-                combined_triggers.append(dt)
-
-        display_name = req.name or enriched_meta.get("model_name") or dest_path.stem
+        triggers = list(enriched_meta.get("triggers", []))
+        triggers.extend(trigger for trigger in detected_triggers if trigger not in triggers)
+        display_name = _display_name(req.name or enriched_meta.get("model_name") or dest_path.stem, "Hugging Face LoRA")
         entry = {
             "name": display_name,
             "path": str(dest_path.resolve()),
             "scale": 1.0,
-            "triggers": combined_triggers,
-            "base_model": enriched_meta.get("base_model", detected_base or "sdxl"),
+            "triggers": triggers[:16],
+            "base_model": detected_base or enriched_meta.get("base_model") or "sdxl",
             "sha256": enriched_meta.get("sha256"),
             "source": "huggingface",
             "hf_repo_id": enriched_meta.get("repo_id"),
             "hf_filename": enriched_meta.get("filename"),
+            "hf_revision": enriched_meta.get("revision"),
+            "hf_resolved_revision": enriched_meta.get("resolved_revision"),
+            "hf_commit_sha": enriched_meta.get("commit_sha"),
         }
-
         if enriched_meta.get("sha256"):
             try:
                 civitai_data = civitai_service.fetch_by_hash(enriched_meta["sha256"])
                 if civitai_data:
-                    cm = civitai_service.extract_civitai_metadata(civitai_data)
-                    if cm.get("civitai_version_id"):
-                        entry["civitai_version_id"] = cm["civitai_version_id"]
-                    if cm.get("civitai_model_id"):
-                        entry["civitai_model_id"] = cm["civitai_model_id"]
-                    if cm.get("civitai_model_name"):
-                        entry["civitai_model_name"] = cm["civitai_model_name"]
-                    if cm.get("civitai_version_name"):
-                        entry["civitai_version_name"] = cm["civitai_version_name"]
+                    metadata = civitai_service.extract_civitai_metadata(civitai_data)
+                    for key in ("civitai_version_id", "civitai_model_id", "civitai_model_name", "civitai_version_name"):
+                        if metadata.get(key):
+                            entry[key] = metadata[key]
             except Exception:
                 pass
-
-        with _loras_lock:
-            loras = _read_loras()
-            loras = [l for l in loras if l["name"] != entry["name"] and l["path"] != entry["path"]]
-            loras.append(entry)
-            _write_loras(loras)
-
-        _finish_task(task_id, entry, f"Installed {entry['name']} successfully!")
-
-    except hf_service.HFAuthError as ae:
-        _fail_task(task_id, ae, auth=True, auth_msg="Hugging Face authentication required")
+        _check_cancelled(cancel_event)
+        _upsert_lora_entries([entry])
+        registered = True
+        if not _finish_task(task_id, entry, f"Installed {entry['name']} successfully!"):
+            _cleanup_registered_entry(entry)
+    except hf_service.HFAuthError as e:
+        if not registered:
+            _cleanup_registered_entry(entry)
+        _fail_task(task_id, e, auth=True, auth_msg="Hugging Face authentication required")
     except Exception as e:
+        if not registered:
+            _cleanup_registered_entry(entry)
         _fail_task(task_id, e)
 
 
 def _start_hf_download_task(url_or_repo: str, custom_name: str | None = None, token: str | None = None) -> dict:
     parsed = hf_service.parse_hf_input(url_or_repo)
     if not parsed:
-        raise HTTPException(400, f"Invalid Hugging Face URL or Repo ID: {url_or_repo}")
-
+        raise HTTPException(400, "Invalid Hugging Face URL or Repo ID")
     try:
         meta = hf_service.fetch_hf_metadata(
             repo_id=parsed["repo_id"],
@@ -226,25 +276,13 @@ def _start_hf_download_task(url_or_repo: str, custom_name: str | None = None, to
             revision=parsed.get("revision", "main"),
             token=token,
         )
-    except hf_service.HFAuthError as ae:
-        raise HTTPException(401, str(ae))
-    except ValueError as ve:
-        raise HTTPException(404, str(ve))
+    except hf_service.HFAuthError as e:
+        raise HTTPException(401, str(e))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
     except Exception as e:
         raise HTTPException(400, str(e))
-
-    with _DOWNLOAD_LOCK:
-        for tid, t in DOWNLOAD_TASKS.items():
-            if t.get("source") == "huggingface" and t.get("repo_id") == meta["repo_id"] and t.get("filename") == meta["filename"] and t.get("status") == "downloading":
-                return {
-                    "task_id": tid,
-                    "status": "downloading",
-                    "model_name": t.get("model_name"),
-                    "base_model": t.get("base_model"),
-                    "source": "huggingface",
-                    "already_running": True,
-                }
-
+    identity = (meta["repo_id"], meta["filename"], meta.get("resolved_revision") or meta.get("revision"))
     task_id = uuid.uuid4().hex[:12]
     cancel_event = threading.Event()
     task = {
@@ -252,391 +290,363 @@ def _start_hf_download_task(url_or_repo: str, custom_name: str | None = None, to
         "source": "huggingface",
         "repo_id": meta["repo_id"],
         "filename": meta["filename"],
-        "model_name": custom_name or meta.get("model_name") or meta["repo_id"],
+        "revision": meta.get("revision"),
+        "resolved_revision": meta.get("resolved_revision"),
+        "identity": identity,
+        "model_name": _display_name(custom_name or meta.get("model_name") or meta["repo_id"], "Hugging Face LoRA"),
         "base_model": meta.get("base_model", "sdxl"),
         "status": "downloading",
         "progress": 0.05,
         "downloaded_bytes": 0,
-        "total_bytes": 0,
+        "total_bytes": meta.get("expected_bytes") or 0,
         "speed_mb_s": 0.0,
-        "status_text": f"Connecting to Hugging Face for {meta.get('model_name', 'LoRA')}...",
+        "status_text": f"Connecting to Hugging Face for {_display_name(meta.get('model_name'), 'LoRA')}...",
         "started_at": time.time(),
         "finished_at": None,
         "error": None,
         "result": None,
+        "worker_active": True,
         "cancel_event": cancel_event,
     }
-
     with _DOWNLOAD_LOCK:
+        for existing_id, existing in DOWNLOAD_TASKS.items():
+            if existing.get("worker_active") and existing.get("source") == "huggingface" and existing.get("identity") == identity:
+                return {
+                    "task_id": existing_id,
+                    "status": existing.get("status", "downloading"),
+                    "model_name": existing.get("model_name"),
+                    "base_model": existing.get("base_model"),
+                    "source": "huggingface",
+                    "already_running": True,
+                }
         DOWNLOAD_TASKS[task_id] = task
-
     req = HFImportRequest(url_or_repo=url_or_repo, name=custom_name, token=token)
-    worker_thread = threading.Thread(
-        target=_run_hf_download,
-        args=(task_id, req, meta, cancel_event),
-        daemon=True,
-    )
-    worker_thread.start()
+    threading.Thread(target=_run_hf_download, args=(task_id, req, meta, cancel_event), daemon=True).start()
+    return {"task_id": task_id, "status": "downloading", "model_name": task["model_name"], "base_model": task["base_model"], "source": "huggingface"}
 
-    return {
-        "task_id": task_id,
-        "status": "downloading",
-        "model_name": task["model_name"],
-        "base_model": task["base_model"],
-        "source": "huggingface",
-    }
+
+def _content_disposition_filename(value: str) -> str | None:
+    if not value:
+        return None
+    message = Message()
+    message["Content-Disposition"] = value
+    try:
+        return message.get_filename()
+    except Exception:
+        return None
+
+
+def _public_url(value: str) -> str:
+    parsed = urlsplit(value)
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
 def _run_direct_url_download(task_id: str, req: DirectUrlImportRequest, cancel_event: threading.Event):
     url = req.url.strip()
-    headers = {"User-Agent": civitai_service.DEFAULT_USER_AGENT}
-    on_progress = make_download_progress_cb(task_id)
-
-    fd, tmp_file = tempfile.mkstemp(dir=str(DATA_DIR), suffix=".download")
-    tmp_path = Path(tmp_file)
-
+    fd = None
+    tmp_path = None
+    final_path = None
+    entry = None
+    registered = False
+    downloaded = 0
+    total_bytes = 0
+    deadline = time.monotonic() + civitai_service.download_deadline_seconds()
     try:
-        on_progress({"status": f"Connecting to {urlparse(url).netloc}...", "progress": 0.05, "downloaded_bytes": 0, "total_bytes": 0, "speed_mb_s": 0.0})
-        parsed_host = (urlparse(url).hostname or "").lower()
-        proxies = {"http": None, "https": None} if parsed_host in ("localhost", "127.0.0.1", "::1") else None
-        with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=30, proxies=proxies) as resp:
-            resp.raise_for_status()
-
-            detected_fname = None
-            cd = resp.headers.get("Content-Disposition", "")
-            if "filename=" in cd:
-                m = re.search(r'filename=["\']?([^"\';]+)["\']?', cd)
-                if m:
-                    detected_fname = m.group(1).strip()
-            if not detected_fname:
-                url_path_name = Path(urlparse(resp.url).path).name
-                if url_path_name and len(url_path_name) > 3:
-                    detected_fname = url_path_name
-
-            if not detected_fname or not detected_fname.endswith(".safetensors"):
-                if req.name:
-                    safe_n = re.sub(r"[^A-Za-z0-9._-]+", "_", req.name).strip("._")
-                    detected_fname = f"{safe_n}.safetensors"
-                else:
-                    detected_fname = f"direct_lora_{task_id}.safetensors"
-
-            total_bytes = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            chunk_size = 1024 * 1024
-            start_time = time.time()
-            last_speed_time = start_time
-            last_speed_bytes = 0
-            current_speed_mb = 0.0
-
-            with os.fdopen(fd, "wb") as out_f:
-                for chunk in resp.iter_content(chunk_size=chunk_size):
-                    if cancel_event and cancel_event.is_set():
-                        raise RuntimeError("Download cancelled by user")
+        _check_cancelled(cancel_event)
+        on_progress = make_download_progress_cb(task_id)
+        on_progress({"status": f"Connecting to {urlsplit(url).hostname}...", "progress": 0.05, "downloaded_bytes": 0, "total_bytes": 0, "speed_mb_s": 0.0})
+        response, final_url = civitai_service.open_public_https_stream(
+            url,
+            headers={"User-Agent": civitai_service.DEFAULT_USER_AGENT, "Accept": "application/octet-stream"},
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
+        with response:
+            if response.status_code != 200:
+                raise RuntimeError(f"Download failed with HTTP {response.status_code}")
+            content_type = str(response.headers.get("Content-Type", "")).lower()
+            if content_type.startswith(("text/html", "application/json", "text/xml")):
+                raise ValueError("Download server returned a non-binary response")
+            detected_name = _content_disposition_filename(str(response.headers.get("Content-Disposition", "")))
+            if not detected_name:
+                detected_name = Path(unquote(urlsplit(final_url).path)).name
+            if not detected_name and req.name:
+                detected_name = f"{req.name}.safetensors"
+            detected_name = _sanitize_filename(detected_name or f"direct_lora_{task_id}.safetensors", f"direct_lora_{task_id}.safetensors")
+            if not detected_name.lower().endswith(".safetensors"):
+                raise ValueError("Downloaded filename is not a .safetensors file")
+            total_bytes = civitai_service._content_length(response.headers)
+            if total_bytes > MAX_LORA_UPLOAD_BYTES:
+                raise ValueError("download exceeds the 8 GB limit")
+            fd, tmp_name = tempfile.mkstemp(dir=str(LORA_FILES_DIR), prefix=".direct-", suffix=".download")
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "wb") as output:
+                fd = None
+                start_time = time.monotonic()
+                last_speed_time = start_time
+                last_speed_bytes = 0
+                current_speed_mb = 0.0
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    _check_cancelled(cancel_event)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Download deadline exceeded")
                     if not chunk:
                         continue
-                    out_f.write(chunk)
                     downloaded += len(chunk)
-
-                    now = time.time()
+                    if downloaded > MAX_LORA_UPLOAD_BYTES:
+                        raise ValueError("download exceeds the 8 GB limit")
+                    output.write(chunk)
+                    now = time.monotonic()
                     dt = now - last_speed_time
                     if dt >= 0.5:
-                        current_speed_mb = ((downloaded - last_speed_bytes) / (1024 * 1024)) / dt
+                        current_speed_mb = ((downloaded - last_speed_bytes) / (1 << 20)) / dt
                         last_speed_time = now
                         last_speed_bytes = downloaded
-
-                    frac = min(0.95, downloaded / float(total_bytes)) if total_bytes > 0 else 0.5
-                    status_text = (
-                        f"Downloading: {downloaded // (1024*1024)}MB / {total_bytes // (1024*1024)}MB "
-                        f"({frac*100:.0f}%) - {current_speed_mb:.1f} MB/s"
-                    ) if total_bytes > 0 else f"Downloading: {downloaded // (1024*1024)}MB - {current_speed_mb:.1f} MB/s"
-                    on_progress({"status": status_text, "progress": frac, "downloaded_bytes": downloaded, "total_bytes": total_bytes, "speed_mb_s": current_speed_mb})
-
-                out_f.flush()
-                os.fsync(out_f.fileno())
-
+                    fraction = min(0.95, downloaded / total_bytes) if total_bytes else 0.5
+                    status = (
+                        f"Downloading: {downloaded >> 20}MB / {total_bytes >> 20}MB ({fraction * 100:.0f}%) - {current_speed_mb:.1f} MB/s"
+                        if total_bytes
+                        else f"Downloading: {downloaded >> 20}MB - {current_speed_mb:.1f} MB/s"
+                    )
+                    on_progress({"status": status, "progress": fraction, "downloaded_bytes": downloaded, "total_bytes": total_bytes, "speed_mb_s": current_speed_mb})
+                output.flush()
+                os.fsync(output.fileno())
+        if total_bytes and downloaded != total_bytes:
+            raise ValueError("Download ended before the expected byte count")
         if not civitai_service.is_valid_safetensors(tmp_path):
-            raise ValueError("Downloaded file is not a valid .safetensors archive.")
-
+            raise ValueError("Downloaded file is not a valid .safetensors archive")
+        _check_cancelled(cancel_event)
         on_progress({"status": "Inspecting model architecture...", "progress": 0.96, "downloaded_bytes": downloaded, "total_bytes": total_bytes, "speed_mb_s": 0.0})
         detected_base, detected_triggers = _inspect_safetensors(tmp_path)
         final_base = req.base_model or detected_base or "sdxl"
         final_triggers = req.triggers if req.triggers is not None else detected_triggers
-
+        if final_base not in _BASE_MODELS:
+            raise ValueError("invalid LoRA base model")
+        if any(not isinstance(trigger, str) or not trigger.strip() or len(trigger) > 200 or any(ord(char) < 32 or ord(char) == 127 for char in trigger) for trigger in final_triggers):
+            raise ValueError("invalid LoRA trigger")
         target_dir = SDXL_LORA_DIR if final_base == "sdxl" else LORA_FILES_DIR
-        target_dir.mkdir(parents=True, exist_ok=True)
-        final_dest = target_dir / detected_fname
-        if final_dest.is_file():
-            final_dest = target_dir / f"{final_dest.stem}_{task_id}{final_dest.suffix}"
-
-        os.replace(tmp_path, final_dest)
-
+        target_root = target_dir.resolve()
+        final_path = (target_root / detected_name).resolve()
+        if not final_path.is_relative_to(target_root):
+            raise ValueError("invalid LoRA destination")
+        if final_path.exists():
+            final_path = (target_root / f"{final_path.stem}_{task_id}.safetensors").resolve()
+            if not final_path.is_relative_to(target_root):
+                raise ValueError("invalid LoRA destination")
+        os.replace(tmp_path, final_path)
+        tmp_path = None
+        try:
+            os.chmod(final_path, 0o600)
+        except OSError:
+            pass
         on_progress({"status": "Computing SHA-256 digest...", "progress": 0.98, "downloaded_bytes": downloaded, "total_bytes": total_bytes, "speed_mb_s": 0.0})
-        sha = civitai_service.compute_file_sha256(final_dest)
-
-        display_name = req.name or final_dest.stem
+        sha = civitai_service.compute_file_sha256(final_path, cancel_event=cancel_event)
+        _check_cancelled(cancel_event)
+        display_name = _display_name(req.name or final_path.stem, "Direct LoRA")
         entry = {
             "name": display_name,
-            "path": str(final_dest.resolve()),
+            "path": str(final_path),
             "scale": 1.0,
             "triggers": final_triggers,
             "base_model": final_base,
             "sha256": sha,
             "source": "direct_url",
-            "url": url,
+            "url": _public_url(url),
         }
-
         try:
             civitai_data = civitai_service.fetch_by_hash(sha)
             if civitai_data:
-                cm = civitai_service.extract_civitai_metadata(civitai_data)
-                if cm.get("civitai_version_id"):
-                    entry["civitai_version_id"] = cm["civitai_version_id"]
-                if cm.get("civitai_model_id"):
-                    entry["civitai_model_id"] = cm["civitai_model_id"]
-                if cm.get("civitai_model_name"):
-                    entry["civitai_model_name"] = cm["civitai_model_name"]
-                if cm.get("civitai_version_name"):
-                    entry["civitai_version_name"] = cm["civitai_version_name"]
-                if not entry.get("triggers") and cm.get("triggers"):
-                    entry["triggers"] = cm["triggers"]
+                metadata = civitai_service.extract_civitai_metadata(civitai_data)
+                for key in ("civitai_version_id", "civitai_model_id", "civitai_model_name", "civitai_version_name"):
+                    if metadata.get(key):
+                        entry[key] = metadata[key]
+                if not entry.get("triggers") and metadata.get("triggers"):
+                    entry["triggers"] = metadata["triggers"]
         except Exception:
             pass
-
-        with _loras_lock:
-            loras = _read_loras()
-            loras = [l for l in loras if l["name"] != entry["name"] and l["path"] != entry["path"]]
-            loras.append(entry)
-            _write_loras(loras)
-
-        _finish_task(task_id, entry, f"Installed {entry['name']} successfully!")
-
+        _check_cancelled(cancel_event)
+        _upsert_lora_entries([entry])
+        registered = True
+        if not _finish_task(task_id, entry, f"Installed {entry['name']} successfully!"):
+            _cleanup_registered_entry(entry)
     except Exception as e:
-        if tmp_path.exists():
+        if not registered:
+            _cleanup_registered_entry(entry)
+            if final_path is not None:
+                try:
+                    resolved = final_path.resolve()
+                    if any(resolved.is_relative_to(root) for root in (LORA_FILES_DIR.resolve(), SDXL_LORA_DIR.resolve())) and resolved.is_file():
+                        resolved.unlink()
+                except OSError:
+                    pass
+        _fail_task(task_id, e)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
             try:
                 tmp_path.unlink()
             except OSError:
                 pass
-        _fail_task(task_id, e)
 
 
 def _start_civitai_download_task(req: CivitaiImportRequest):
-    """Start asynchronous download and registration of a LoRA from Civitai, with HF auto-routing."""
     cleaned = req.url_or_id.strip()
-
-    # Auto-routing: if user pasted an HF URL or repo ID, handle transparently
     if hf_service.parse_hf_input(cleaned):
         return _start_hf_download_task(cleaned, custom_name=req.name, token=req.api_key)
-
-    vid = civitai_service.parse_civitai_input(cleaned, api_key=req.api_key)
-    if not vid:
-        raise HTTPException(400, f"Invalid Civitai or Hugging Face URL / ID: {req.url_or_id}")
-
-    version_info = civitai_service.fetch_by_version_id(vid, api_key=req.api_key)
-    if not version_info:
-        raise HTTPException(404, f"Civitai model version {vid} not found")
-
     try:
-        meta = civitai_service.extract_civitai_metadata(version_info)
-    except ValueError as ve:
-        raise HTTPException(400, str(ve))
-
-    with _DOWNLOAD_LOCK:
-        for tid, t in DOWNLOAD_TASKS.items():
-            if t.get("version_id") == vid and t.get("status") == "downloading":
-                return {
-                    "task_id": tid,
-                    "status": "downloading",
-                    "model_name": t.get("model_name"),
-                    "base_model": t.get("base_model"),
-                    "source": "civitai",
-                    "already_running": True,
-                }
-
+        version_id = civitai_service.parse_civitai_input(cleaned, api_key=req.api_key)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    if not version_id:
+        raise HTTPException(400, "Invalid Civitai or Hugging Face URL / ID")
+    try:
+        meta = civitai_service.extract_civitai_metadata(
+            civitai_service.fetch_by_version_id(version_id, api_key=req.api_key) or {}
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     task_id = uuid.uuid4().hex[:12]
     cancel_event = threading.Event()
     task = {
         "id": task_id,
         "source": "civitai",
-        "version_id": vid,
-        "model_name": meta.get("civitai_model_name") or f"LoRA #{vid}",
+        "version_id": version_id,
+        "identity": ("civitai", version_id),
+        "model_name": _display_name(req.name or meta.get("civitai_model_name") or f"LoRA #{version_id}", f"LoRA #{version_id}"),
         "base_model": meta.get("base_model", "sdxl"),
         "status": "downloading",
         "progress": 0.05,
         "downloaded_bytes": 0,
-        "total_bytes": 0,
+        "total_bytes": meta.get("expected_bytes") or 0,
         "speed_mb_s": 0.0,
-        "status_text": f"Connecting to Civitai for {meta.get('civitai_model_name', 'LoRA')}...",
+        "status_text": f"Connecting to Civitai for {_display_name(meta.get('civitai_model_name'), 'LoRA')}...",
         "started_at": time.time(),
         "finished_at": None,
         "error": None,
         "result": None,
+        "worker_active": True,
         "cancel_event": cancel_event,
     }
-
     with _DOWNLOAD_LOCK:
+        for existing_id, existing in DOWNLOAD_TASKS.items():
+            if existing.get("worker_active") and existing.get("source") == "civitai" and existing.get("version_id") == version_id:
+                return {"task_id": existing_id, "status": existing.get("status", "downloading"), "model_name": existing.get("model_name"), "base_model": existing.get("base_model"), "source": "civitai", "already_running": True}
         DOWNLOAD_TASKS[task_id] = task
-
-    worker_thread = threading.Thread(
-        target=_run_civitai_download,
-        args=(task_id, req, meta, vid, cancel_event),
-        daemon=True,
-    )
-    worker_thread.start()
-
-    return {
-        "task_id": task_id,
-        "status": "downloading",
-        "model_name": task["model_name"],
-        "base_model": task["base_model"],
-        "source": "civitai",
-    }
+    threading.Thread(target=_run_civitai_download, args=(task_id, req, version_id, cancel_event), daemon=True).start()
+    return {"task_id": task_id, "status": "downloading", "model_name": task["model_name"], "base_model": task["base_model"], "source": "civitai"}
 
 
 def _start_direct_url_download_task(req: DirectUrlImportRequest):
-    """Start asynchronous download and registration of a LoRA from any direct HTTP/HTTPS URL."""
     url = req.url.strip()
-    if not url.startswith(("http://", "https://")):
-        raise HTTPException(400, "URL must start with http:// or https://")
-
     if hf_service.parse_hf_input(url):
         return _start_hf_download_task(url, custom_name=req.name)
-
+    try:
+        validated_url = civitai_service.validate_public_https_url(url)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    url_identity = hashlib.sha256(validated_url.encode("utf-8")).hexdigest()
     task_id = uuid.uuid4().hex[:12]
     cancel_event = threading.Event()
+    path_stem = Path(urlsplit(validated_url).path).stem
+    safe_stem = civitai_service._safe_filename(path_stem, f"direct_lora_{task_id}.safetensors").removesuffix(".safetensors")[:80]
     task = {
         "id": task_id,
         "source": "direct_url",
-        "url": url,
-        "model_name": req.name or Path(urlparse(url).path).stem or f"Direct LoRA #{task_id}",
+        "url": _public_url(validated_url),
+        "identity": ("direct_url", url_identity),
+        "model_name": _display_name(req.name or safe_stem, f"Direct LoRA #{task_id}"),
         "base_model": req.base_model or "sdxl",
         "status": "downloading",
         "progress": 0.05,
         "downloaded_bytes": 0,
         "total_bytes": 0,
         "speed_mb_s": 0.0,
-        "status_text": f"Connecting to {urlparse(url).netloc}...",
+        "status_text": f"Connecting to {urlsplit(validated_url).hostname}...",
         "started_at": time.time(),
         "finished_at": None,
         "error": None,
         "result": None,
+        "worker_active": True,
         "cancel_event": cancel_event,
     }
-
     with _DOWNLOAD_LOCK:
+        for existing_id, existing in DOWNLOAD_TASKS.items():
+            if existing.get("worker_active") and existing.get("identity") == task["identity"]:
+                return {"task_id": existing_id, "status": existing.get("status", "downloading"), "model_name": existing.get("model_name"), "base_model": existing.get("base_model"), "source": "direct_url", "already_running": True}
         DOWNLOAD_TASKS[task_id] = task
+    threading.Thread(target=_run_direct_url_download, args=(task_id, req, cancel_event), daemon=True).start()
+    return {"task_id": task_id, "status": "downloading", "model_name": task["model_name"], "base_model": task["base_model"], "source": "direct_url"}
 
-    worker_thread = threading.Thread(
-        target=_run_direct_url_download,
-        args=(task_id, req, cancel_event),
-        daemon=True,
-    )
-    worker_thread.start()
 
-    return {
-        "task_id": task_id,
-        "status": "downloading",
-        "model_name": task["model_name"],
-        "base_model": task["base_model"],
-        "source": "direct_url",
-    }
+def _validate_import_options(name: str | None, triggers: list[str] | None):
+    if name is not None and (not name.strip() or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+        raise HTTPException(400, "invalid download name")
+    if triggers is not None and any(not isinstance(trigger, str) or not trigger.strip() or len(trigger) > 200 for trigger in triggers):
+        raise HTTPException(400, "invalid download trigger")
 
 
 @router.post("/api/loras/download")
 def download_lora_unified(req: UnifiedDownloadRequest):
-    """Universal endpoint to download and register a LoRA from Civitai, Hugging Face, or direct HTTP/HTTPS link."""
+    _validate_import_options(req.name, req.triggers)
     raw = req.url_or_id.strip()
-    if not raw:
-        raise HTTPException(400, "URL or Model ID is required.")
-
-    # 1. Hugging Face
     if hf_service.parse_hf_input(raw):
-        return _start_hf_download_task(
-            raw,
-            custom_name=req.name,
-            token=req.token,
-        )
-
-    # 2. Civitai
-    if "civitai.com" in raw.lower() or "civitai.red" in raw.lower() or (raw.isdigit() and len(raw) <= 10):
-        civitai_req = CivitaiImportRequest(
-            url_or_id=raw,
-            api_key=req.api_key or req.token,
-        )
-        return _start_civitai_download_task(civitai_req)
-
-    # 3. Direct HTTP/HTTPS
-    if raw.startswith(("http://", "https://")):
-        direct_req = DirectUrlImportRequest(
-            url=raw,
-            name=req.name,
-            triggers=req.triggers,
-            base_model=req.base_model,
-        )
-        return _start_direct_url_download_task(direct_req)
-
-    # 4. Fallback check with civitai parser
+        return _start_hf_download_task(raw, custom_name=req.name, token=req.token)
     try:
-        if civitai_service.parse_civitai_input(raw):
-            civitai_req = CivitaiImportRequest(
-                url_or_id=raw,
-                api_key=req.api_key or req.token,
-            )
-            return _start_civitai_download_task(civitai_req)
-    except Exception:
-        pass
-
-    raise HTTPException(
-        400,
-        f"Could not identify download source for '{raw}'. Please provide a valid Civitai link/ID, Hugging Face repo/link, or direct HTTP/HTTPS link."
-    )
+        host = (urlsplit(raw).hostname or "").lower() if raw.lower().startswith(("http://", "https://")) else ""
+    except ValueError:
+        host = ""
+    if host in _CIVITAI_HOSTS or (raw.isdigit() and len(raw) <= 10):
+        return _start_civitai_download_task(CivitaiImportRequest(url_or_id=raw, name=req.name, api_key=req.api_key or req.token))
+    if raw.lower().startswith(("http://", "https://")):
+        return _start_direct_url_download_task(DirectUrlImportRequest(url=raw, name=req.name, triggers=req.triggers, base_model=req.base_model))
+    if civitai_service.parse_civitai_input(raw):
+        return _start_civitai_download_task(CivitaiImportRequest(url_or_id=raw, name=req.name, api_key=req.api_key or req.token))
+    raise HTTPException(400, "Could not identify download source")
 
 
 @router.get("/api/loras/downloads")
 def get_lora_downloads():
-    """Get active and recent LoRA download tasks with live progress and transfer speed."""
+    hidden_keys = {"cancel_event", "worker_active", "identity", "url", "repo_id", "filename", "revision", "resolved_revision"}
     with _DOWNLOAD_LOCK:
         now = time.time()
-        to_delete = [
-            tid for tid, t in DOWNLOAD_TASKS.items()
-            if t["status"] in ("done", "error", "cancelled")
-            and t.get("finished_at")
-            and (now - t["finished_at"] > 600)
-        ]
-        for tid in to_delete:
-            DOWNLOAD_TASKS.pop(tid, None)
-
-        res = []
-        for tid, t in DOWNLOAD_TASKS.items():
-            item = {k: v for k, v in t.items() if k != "cancel_event"}
-            res.append(item)
-        res.sort(key=lambda x: x.get("started_at", 0), reverse=True)
-        return res
+        for task_id in [
+            task_id
+            for task_id, task in DOWNLOAD_TASKS.items()
+            if task.get("status") in ("done", "error", "cancelled") and not task.get("worker_active") and task.get("finished_at") and now - task["finished_at"] > 600
+        ]:
+            DOWNLOAD_TASKS.pop(task_id, None)
+        result = [{key: value for key, value in task.items() if key not in hidden_keys} for task in DOWNLOAD_TASKS.values()]
+    result.sort(key=lambda item: item.get("started_at", 0), reverse=True)
+    return result
 
 
 @router.delete("/api/loras/downloads/{task_id}")
 def cancel_lora_download(task_id: str):
-    """Cancel an ongoing LoRA download."""
     with _DOWNLOAD_LOCK:
-        t = DOWNLOAD_TASKS.get(task_id)
-        if not t:
+        task = DOWNLOAD_TASKS.get(task_id)
+        if not task:
             raise HTTPException(404, "Download task not found")
-        if t["status"] == "downloading":
-            ce = t.get("cancel_event")
-            if ce:
-                ce.set()
-            t["status"] = "cancelled"
-            t["status_text"] = "Download cancelled by user"
-            t["finished_at"] = time.time()
+        if task.get("status") == "downloading":
+            cancel_event = task.get("cancel_event")
+            if cancel_event:
+                cancel_event.set()
+            task["status"] = "cancelled"
+            task["status_text"] = "Download cancelled by user"
+            task["finished_at"] = time.time()
+            task.pop("cancel_event", None)
         return {"status": "ok", "task_id": task_id}
 
 
 class ModelDownloadRequest(BaseModel):
-    model_id: str
+    model_config = ConfigDict(extra="forbid")
+    model_id: str = Field(min_length=1, max_length=120)
 
 
 class _ModelDownloadTqdm:
-    """tqdm factory that reports per-chunk bytes into MODEL_DOWNLOAD_TASKS."""
-
     def __init__(self, task_id: str, cancel_event: threading.Event):
         self._task_id = task_id
         self._cancel_event = cancel_event
@@ -661,211 +671,263 @@ class _ReportingTqdm:
         return self
 
     def __exit__(self, *exc):
-        # Cancel the in-flight file when the user aborts mid-chunk.
         if self._cancel_event.is_set():
-            raise RuntimeError("Download cancelled by user")
+            raise civitai_service.DownloadCancelled("Download cancelled by user")
         return self._base.__exit__(*exc)
 
     def update(self, n=1):
         if self._cancel_event.is_set():
-            raise RuntimeError("Download cancelled by user")
+            raise civitai_service.DownloadCancelled("Download cancelled by user")
         with _MODEL_DOWNLOAD_LOCK:
-            t = MODEL_DOWNLOAD_TASKS.get(self._task_id)
-            if t and t["status"] == "downloading":
-                t["downloaded_bytes"] = t.get("downloaded_bytes", 0) + int(n)
-                total = t.get("total_bytes") or 0
-                t["progress"] = min(0.99, t["downloaded_bytes"] / total) if total else 0.5
-                now = time.time()
-                dt = now - t.get("_speed_t", now)
-                if dt >= 0.4:
-                    t["speed_mb_s"] = ((t["downloaded_bytes"] - t.get("_speed_b", 0)) / (1024 * 1024)) / dt
-                    t["_speed_t"] = now
-                    t["_speed_b"] = t["downloaded_bytes"]
+            task = MODEL_DOWNLOAD_TASKS.get(self._task_id)
+            if task and task.get("status") == "downloading":
+                task["downloaded_bytes"] = task.get("downloaded_bytes", 0) + int(n)
+                total = task.get("total_bytes") or 0
+                task["progress"] = min(0.99, task["downloaded_bytes"] / total) if total else 0.5
+                now = time.monotonic()
+                elapsed = now - task.get("_speed_t", now)
+                if elapsed >= 0.4:
+                    task["speed_mb_s"] = ((task["downloaded_bytes"] - task.get("_speed_b", 0)) / (1 << 20)) / elapsed
+                    task["_speed_t"] = now
+                    task["_speed_b"] = task["downloaded_bytes"]
                 if total:
-                    mb_dl = t["downloaded_bytes"] // (1024 * 1024)
-                    mb_tot = total // (1024 * 1024)
-                    t["status_text"] = (
-                        f"Downloading {mb_dl}/{mb_tot} MB ({t['progress']*100:.0f}%)"
-                        + (f" - {t['speed_mb_s']:.1f} MB/s" if t.get("speed_mb_s") else "")
-                    )
+                    task["status_text"] = f"Downloading {task['downloaded_bytes'] >> 20}/{total >> 20} MB ({task['progress'] * 100:.0f}%)"
         return self._base.update(n)
 
 
 def _fail_model_task(task_id: str, error: Exception | str):
     with _MODEL_DOWNLOAD_LOCK:
-        t = MODEL_DOWNLOAD_TASKS.get(task_id)
-        if t:
-            is_cancelled = "cancelled by user" in str(error).lower()
-            t["status"] = "cancelled" if is_cancelled else "error"
-            t["error"] = str(error)
-            t["status_text"] = "Download cancelled" if is_cancelled else f"Download failed: {error}"
-            t["finished_at"] = time.time()
-            t.pop("cancel_event", None)
+        task = MODEL_DOWNLOAD_TASKS.get(task_id)
+        if not task:
+            return False
+        if task.get("status") != "downloading":
+            if task.get("status") == "cancelled":
+                task["worker_active"] = False
+            return False
+        message = str(error)
+        cancelled = isinstance(error, civitai_service.DownloadCancelled) or "cancelled by user" in message.lower()
+        task["status"] = "cancelled" if cancelled else "error"
+        task["worker_active"] = False
+        task["error"] = message[:2000]
+        task["status_text"] = "Download cancelled" if cancelled else f"Download failed: {message}"[:500]
+        task["finished_at"] = time.time()
+        task.pop("cancel_event", None)
+        return True
 
 
 def _finish_model_task(task_id: str, status_text: str):
     with _MODEL_DOWNLOAD_LOCK:
-        t = MODEL_DOWNLOAD_TASKS.get(task_id)
-        if t:
-            t["status"] = "done"
-            t["progress"] = 1.0
-            t["finished_at"] = time.time()
-            t["status_text"] = status_text
-            t["result"] = {"model_id": t.get("model_id")}
-            t.pop("cancel_event", None)
+        task = MODEL_DOWNLOAD_TASKS.get(task_id)
+        if not task:
+            return False
+        if task.get("status") != "downloading":
+            if task.get("status") == "cancelled":
+                task["worker_active"] = False
+            return False
+        task["status"] = "done"
+        task["worker_active"] = False
+        task["progress"] = 1.0
+        task["finished_at"] = time.time()
+        task["status_text"] = status_text[:500]
+        task["result"] = {"model_id": task.get("model_id")}
+        task.pop("cancel_event", None)
+        return True
 
 
-def _run_model_download(task_id: str, model_id: str, cancel_event: threading.Event):
-    minfo = generator.get_model_info(model_id)
-    repo = generator.model_download_repo(model_id, minfo)
-    label = minfo.get("label", model_id)
+def _valid_model_filename(value: object) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 1024 or value.startswith("/") or "\\" in value or "\x00" in value:
+        return None
+    normalized = value
+    parts = normalized.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    return normalized
 
-    if not repo or repo.startswith("local:"):
-        _fail_model_task(task_id, f"{label} is a local model — nothing to download from Hugging Face.")
-        return
 
+def _incomplete_paths(target_dir: Path | None, repo: str) -> set[Path]:
+    root = target_dir / ".cache" / "huggingface" / "download" if target_dir else Path.home() / ".cache" / "huggingface" / "hub" / f"models--{repo.replace('/', '--')}" / "blobs"
+    try:
+        return {
+            path.resolve()
+            for path in root.rglob("*")
+            if path.is_file() and path.name.endswith((".incomplete", ".part"))
+        } if root.is_dir() else set()
+    except OSError:
+        return set()
+
+
+def _snapshot_files(root: Path | None) -> set[Path]:
+    if root is None:
+        return set()
+    try:
+        return {path for path in root.rglob("*") if path.is_file()}
+    except OSError:
+        return set()
+
+
+def _run_model_download(task_id: str, model_id: str, minfo: dict, cancel_event: threading.Event):
     target_dir = None
-    if minfo.get("engine") == "sdxl":
-        target_dir = minfo.get("model_dir")
-        if target_dir:
-            Path(target_dir).mkdir(parents=True, exist_ok=True)
-
-    token = hf_service.get_hf_token()
-    files = []
-    total = 0
+    repo = ""
+    before_incomplete = set()
+    before_files = set()
+    cleanup_root = None
     try:
-        # Precompute the file list + total bytes so the bar tracks global progress.
+        _check_cancelled(cancel_event)
+        candidate_repo = generator.model_download_repo(model_id, minfo)
+        if hf_service._valid_repo_id(candidate_repo) is None or str(candidate_repo).startswith("local:"):
+            _fail_model_task(task_id, f"{minfo.get('label', model_id)} has no downloadable Hugging Face repository")
+            return
+        repo = str(candidate_repo)
+        if minfo.get("engine") == "sdxl":
+            configured_dir = minfo.get("model_dir")
+            if not configured_dir:
+                raise ValueError("model download directory is not configured")
+            target_dir = Path(configured_dir)
+            target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.chmod(target_dir, 0o700)
+            except OSError:
+                pass
+        cleanup_root = target_dir if target_dir is not None else _hf_repo_cache_dir(repo)
+        before_files = _snapshot_files(cleanup_root)
+        before_incomplete = _incomplete_paths(target_dir, repo)
+        token = hf_service.get_hf_token()
         info = HfApi(token=token).model_info(repo, files_metadata=True, token=token)
-        for sib in getattr(info, "siblings", []) or []:
-            files.append(sib.rfilename)
-            total += getattr(sib, "size", 0) or 0
+        revision = str(getattr(info, "sha", "") or "")
+        if not re.fullmatch(r"[A-Fa-f0-9]{40,64}", revision):
+            raise ValueError("Hugging Face did not return a revision identity")
+        files = []
+        total = 0
+        for sibling in getattr(info, "siblings", []) or []:
+            filename = _valid_model_filename(getattr(sibling, "rfilename", None))
+            if not filename:
+                continue
+            size = int(getattr(sibling, "size", 0) or 0)
+            if size < 0:
+                raise ValueError("invalid Hugging Face file size")
+            files.append((filename, size))
+            total += size
+        if not files or len(files) > 10000:
+            raise ValueError("Hugging Face model file list is invalid")
         with _MODEL_DOWNLOAD_LOCK:
-            t = MODEL_DOWNLOAD_TASKS.get(task_id)
-            if t:
-                t["total_bytes"] = total
-                t["status_text"] = f"Downloading {label} weights from {repo}…"
-    except Exception as e:
-        _fail_model_task(task_id, f"Could not inspect {repo}: {e}")
-        return
-
-    try:
+            task = MODEL_DOWNLOAD_TASKS.get(task_id)
+            if task and task.get("status") == "downloading":
+                task["total_bytes"] = total
+                task["revision"] = revision
+                task["status_text"] = f"Downloading {minfo.get('label', model_id)} weights..."
         from huggingface_hub import hf_hub_download
 
-        for i, fname in enumerate(files, start=1):
-            if cancel_event.is_set():
-                raise RuntimeError("Download cancelled by user")
+        for index, (filename, _) in enumerate(files, start=1):
+            _check_cancelled(cancel_event)
             with _MODEL_DOWNLOAD_LOCK:
-                t = MODEL_DOWNLOAD_TASKS.get(task_id)
-                if t:
-                    t["status_text"] = f"Downloading {label} weights: {fname} ({i}/{len(files)})"
-            # Individual hf_hub_download calls DO thread tqdm_class through per-byte chunk
-            # reporting (snapshot_download does not). Local dir for SDXL diffusers layouts,
-            # default HF hub cache otherwise (so mflux + is_model_cached find the weights).
+                task = MODEL_DOWNLOAD_TASKS.get(task_id)
+                if task and task.get("status") == "downloading":
+                    task["status_text"] = f"Downloading {minfo.get('label', model_id)} weights: {filename} ({index}/{len(files)})"
             hf_hub_download(
                 repo_id=repo,
-                filename=fname,
+                filename=filename,
+                revision=revision,
                 token=token,
                 local_dir=str(target_dir) if target_dir else None,
                 tqdm_class=_ModelDownloadTqdm(task_id, cancel_event),
             )
-        _finish_model_task(task_id, f"{label} installed successfully!")
+        if not _finish_model_task(task_id, f"{minfo.get('label', model_id)} installed successfully!"):
+            for path in _snapshot_files(cleanup_root) - before_files:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            return
     except Exception as e:
+        if repo:
+            for path in _snapshot_files(cleanup_root) - before_files:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            for path in _incomplete_paths(target_dir, repo) - before_incomplete:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
         _fail_model_task(task_id, e)
 
 
 @router.post("/api/models/download")
 def download_model(req: ModelDownloadRequest):
-    """Start an asynchronous download of a model's weights with a live progress bar."""
     model_id = req.model_id.strip()
-    minfo = generator.get_model_info(model_id)
-    if model_id != minfo.get("id") and minfo.get("id") != req.model_id:
+    minfo = generator.MODELS.get(model_id)
+    if minfo is None:
         raise HTTPException(404, f"Unknown model: {model_id}")
-
-    if generator.is_model_cached(model_id):
-        return {"status": "already_installed", "model_id": model_id, "model_name": minfo.get("label", model_id)}
-
-    with _MODEL_DOWNLOAD_LOCK:
-        for tid, t in MODEL_DOWNLOAD_TASKS.items():
-            if t.get("model_id") == model_id and t.get("status") == "downloading":
-                return {
-                    "task_id": tid,
-                    "status": "downloading",
-                    "model_name": t.get("model_name"),
-                    "already_running": True,
-                }
-
-    task_id = uuid.uuid4().hex[:12]
-    cancel_event = threading.Event()
-    task = {
-        "id": task_id,
-        "source": "model",
-        "model_id": model_id,
-        "model_name": minfo.get("label", model_id),
-        "engine": minfo.get("engine", "mflux"),
-        "status": "downloading",
-        "progress": 0.0,
-        "downloaded_bytes": 0,
-        "total_bytes": 0,
-        "speed_mb_s": 0.0,
-        "status_text": f"Preparing download of {minfo.get('label', model_id)}…",
-        "started_at": time.time(),
-        "finished_at": None,
-        "error": None,
-        "result": None,
-        "cancel_event": cancel_event,
-    }
-    with _MODEL_DOWNLOAD_LOCK:
-        MODEL_DOWNLOAD_TASKS[task_id] = task
-
-    worker_thread = threading.Thread(
-        target=_run_model_download,
-        args=(task_id, model_id, cancel_event),
-        daemon=True,
-    )
-    worker_thread.start()
-
-    return {
-        "task_id": task_id,
-        "status": "downloading",
-        "model_name": task["model_name"],
-        "source": "model",
-    }
+    repo_id = generator.model_download_repo(model_id, minfo)
+    if hf_service._valid_repo_id(repo_id) is None or str(repo_id).startswith("local:"):
+        raise HTTPException(400, f"{minfo.get('label', model_id)} has no downloadable Hugging Face repository")
+    with generator._model_maintenance_lock:
+        with _MODEL_DOWNLOAD_LOCK:
+            for task_id, task in MODEL_DOWNLOAD_TASKS.items():
+                if task.get("model_id") == model_id and task.get("worker_active"):
+                    return {"task_id": task_id, "status": task.get("status", "downloading"), "model_name": task.get("model_name"), "already_running": True}
+        if _model_is_fully_cached(model_id, minfo):
+            return {"status": "already_installed", "model_id": model_id, "model_name": minfo.get("label", model_id)}
+        task_id = uuid.uuid4().hex[:12]
+        cancel_event = threading.Event()
+        task = {
+            "id": task_id,
+            "source": "model",
+            "model_id": model_id,
+            "repo_id": repo_id,
+            "model_name": minfo.get("label", model_id),
+            "engine": minfo.get("engine", "mflux"),
+            "status": "downloading",
+            "progress": 0.0,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "speed_mb_s": 0.0,
+            "status_text": f"Preparing download of {minfo.get('label', model_id)}...",
+            "started_at": time.time(),
+            "finished_at": None,
+            "error": None,
+            "result": None,
+            "worker_active": True,
+            "cancel_event": cancel_event,
+        }
+        with _MODEL_DOWNLOAD_LOCK:
+            for existing_id, existing in MODEL_DOWNLOAD_TASKS.items():
+                if existing.get("model_id") == model_id and existing.get("worker_active"):
+                    return {"task_id": existing_id, "status": existing.get("status", "downloading"), "model_name": existing.get("model_name"), "already_running": True}
+            MODEL_DOWNLOAD_TASKS[task_id] = task
+        threading.Thread(target=_run_model_download, args=(task_id, model_id, minfo, cancel_event), daemon=True).start()
+        return {"task_id": task_id, "status": "downloading", "model_name": task["model_name"], "source": "model"}
 
 
 @router.get("/api/models/downloads")
 def get_model_downloads():
-    """Get active and recent model (weights) download tasks with live progress."""
+    hidden_keys = {"cancel_event", "worker_active", "_speed_t", "_speed_b"}
     with _MODEL_DOWNLOAD_LOCK:
         now = time.time()
-        to_delete = [
-            tid for tid, t in MODEL_DOWNLOAD_TASKS.items()
-            if t["status"] in ("done", "error", "cancelled")
-            and t.get("finished_at")
-            and (now - t["finished_at"] > 600)
-        ]
-        for tid in to_delete:
-            MODEL_DOWNLOAD_TASKS.pop(tid, None)
-
-        res = []
-        for tid, t in MODEL_DOWNLOAD_TASKS.items():
-            item = {k: v for k, v in t.items() if k not in ("cancel_event", "_speed_t", "_speed_b")}
-            res.append(item)
-        res.sort(key=lambda x: x.get("started_at", 0), reverse=True)
-        return res
+        for task_id in [
+            task_id
+            for task_id, task in MODEL_DOWNLOAD_TASKS.items()
+            if task.get("status") in ("done", "error", "cancelled") and not task.get("worker_active") and task.get("finished_at") and now - task["finished_at"] > 600
+        ]:
+            MODEL_DOWNLOAD_TASKS.pop(task_id, None)
+        result = [{key: value for key, value in task.items() if key not in hidden_keys} for task in MODEL_DOWNLOAD_TASKS.values()]
+    result.sort(key=lambda item: item.get("started_at", 0), reverse=True)
+    return result
 
 
 @router.delete("/api/models/downloads/{task_id}")
 def cancel_model_download(task_id: str):
-    """Cancel an ongoing model (weights) download."""
     with _MODEL_DOWNLOAD_LOCK:
-        t = MODEL_DOWNLOAD_TASKS.get(task_id)
-        if not t:
+        task = MODEL_DOWNLOAD_TASKS.get(task_id)
+        if not task:
             raise HTTPException(404, "Download task not found")
-        if t["status"] == "downloading":
-            ce = t.get("cancel_event")
-            if ce:
-                ce.set()
-            t["status"] = "cancelled"
-            t["status_text"] = "Download cancelled by user"
-            t["finished_at"] = time.time()
+        if task.get("status") == "downloading":
+            cancel_event = task.get("cancel_event")
+            if cancel_event:
+                cancel_event.set()
+            task["status"] = "cancelled"
+            task["status_text"] = "Download cancelled by user"
+            task["finished_at"] = time.time()
+            task.pop("cancel_event", None)
         return {"status": "ok", "task_id": task_id}

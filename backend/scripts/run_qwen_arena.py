@@ -24,6 +24,9 @@ REPO = Path(__file__).resolve().parents[2]
 IMAGES_DIR = REPO / "comparison_12_vs_4_steps" / "images"
 REPORT = REPO / "backend" / "data" / "generated" / "qwen_arena_results.json"
 POLL_INTERVAL = 5
+sys.path.insert(0, str(REPO / "backend"))
+
+from image_meta import atomic_write_json
 
 SCENES = [
     {
@@ -104,7 +107,7 @@ def _get(path):
         return json.loads(r.read())
 
 
-def run_scene(scene, report, only=None, width=512, height=512, force=False):
+def run_scene(scene, report, only=None, width=512, height=512, force=False, report_path=REPORT):
     sid = scene["id"]
     if only and sid not in only:
         return
@@ -138,6 +141,7 @@ def run_scene(scene, report, only=None, width=512, height=512, force=False):
     if status != "done":
         print(f"[FAIL] {sid} status={status} err={st.get('error', st.get('phase_detail', '?'))}", flush=True)
         report[sid] = {"status": status, "wall": wall, "error": st.get("error")}
+        _save(report, report_path)
         return
     results = st.get("results") or []
     gen_time = results[0].get("generation_time", 0.0) if results else 0.0
@@ -146,12 +150,14 @@ def run_scene(scene, report, only=None, width=512, height=512, force=False):
     if not saved:
         print(f"[FAIL] {sid} no saved id", flush=True)
         report[sid] = {"status": "error", "wall": wall, "error": "no saved id"}
+        _save(report, report_path)
         return
     src = REPO / "backend" / "data" / "generated" / f"{saved}.png"
     dst = IMAGES_DIR / f"qwen-image-2.1_{sid}.png"
     if not src.exists():
         print(f"[FAIL] {sid} missing artifact {src}", flush=True)
         report[sid] = {"status": "error", "wall": wall}
+        _save(report, report_path)
         return
     shutil.copy2(src, dst)
     report[sid] = {
@@ -162,15 +168,16 @@ def run_scene(scene, report, only=None, width=512, height=512, force=False):
         "wall": wall,
         "image": str(dst.relative_to(REPO)),
         "job_id": jid,
+        "cache_state": "cold-per-job-subprocess",
+        "timing_scope": "load_time and generation_time come from the engine result; wall includes API polling",
     }
-    report["_meta"] = {"width": width, "height": height, "steps": 20, "guidance": 1.0, "sampler": "linear", "model": "qwen-image-2.1"}
+    report["_meta"] = {"width": width, "height": height, "steps": 20, "guidance": 1.0, "sampler": "linear", "model": "qwen-image-2.1", "cache_state": "cold-per-job-subprocess"}
     print(f"[done] {sid} gen={gen_time}s load={load_time}s wall={wall}s -> {dst.name}", flush=True)
-    _save(report)
+    _save(report, report_path)
 
 
-def _save(report):
-    REPORT.parent.mkdir(parents=True, exist_ok=True)
-    REPORT.write_text(json.dumps(report, indent=2, sort_keys=True))
+def _save(report, path=REPORT):
+    atomic_write_json(path, report, sort_keys=True)
 
 
 def main():
@@ -196,11 +203,11 @@ def main():
             print(f"[skip] {sid} already done", flush=True)
             continue
         try:
-            run_scene(scene, report, only, args.width, args.height, force=args.force)
+            run_scene(scene, report, only, args.width, args.height, force=args.force, report_path=_rp)
         except Exception as e:
             print(f"[ERR] {scene['id']}: {type(e).__name__}: {e}", flush=True)
             report[scene["id"]] = {"status": "error", "error": str(e)}
-            _save(report)
+            _save(report, _rp)
     done = sum(1 for v in report.values() if v.get("status") == "done")
     print(f"== {done}/{len(SCENES)} scenes done. report: {_rp}", flush=True)
 

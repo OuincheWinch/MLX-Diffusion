@@ -4,24 +4,33 @@ Spawns one fresh, isolated interpreter per generation so the long-lived API work
 process-global state can never corrupt denoising (fresh processes are provably clean).
 Speaks JSON-lines on stdout: progress/phase updates and one final result dict.
 """
+import gc
 import json
+import math
 import os
+import signal
 import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("MLX_KREA_WIRED_LIMIT_GB", "9")
 import mlx.core as mx
+from mflux.models.common.vae.tiling_config import TilingConfig
 from mflux.models.qwen21.variants.txt2img.qwen_image_21 import QwenImage21
 
 MODEL = "mlx-community/Qwen-Image-2.1-MLX-4bit"
 QWEN_SCHEDULERS = {"linear": "linear", "euler": "flow_match_euler_discrete"}
+_MAX_PROMPT_BYTES = 128 * (1 << 10)
 
 
-def _wired_budget():
+def _wired_budget(requested=None):
+    if requested is not None:
+        try:
+            return max(0, int(requested))
+        except (TypeError, ValueError):
+            pass
     try:
         d = mx.device_info()
-        cap = d.get("max_recommended_working_set_size") or 0
+        cap = d.get("max_recommended_working_set_size") or d.get("recommended_max_working_set_size") or 0
         mem = d.get("memory_size", 0)
         if mem > 0:
             budget = min(int(mem * 0.68), 9 * (1 << 30))
@@ -68,6 +77,33 @@ def _fingerprint(name, arr):
         emit({"diag": name, "error": str(e)})
 
 
+def _value_bytes(value) -> int:
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+    if isinstance(value, dict):
+        return sum(_value_bytes(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_value_bytes(v) for v in value)
+    return 0
+
+
+class _BoundedPromptCache(dict):
+    def __init__(self, initial=None):
+        super().__init__(initial or {})
+        self._trim()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._trim()
+
+    def _trim(self):
+        total = sum(_value_bytes(v) for v in self.values())
+        while self and (len(self) > 8 or total > 128 * (1 << 20)):
+            key = next(iter(self))
+            total -= _value_bytes(self.pop(key))
+
+
 class _StepCB:
     def __init__(self, phase_cb=None):
         self._phase_cb = phase_cb
@@ -98,27 +134,97 @@ def main() -> int:
         emit({"error": f"bad request: {e}"})
         return 2
 
-    set_limit = getattr(mx, "set_wired_limit", None) or mx.metal.set_wired_limit
-    set_limit(_wired_budget())
+    try:
+        prompt = str(req.get("prompt") or "")
+        if not prompt.strip():
+            raise ValueError("prompt is required")
+        if len(prompt.encode("utf-8")) > _MAX_PROMPT_BYTES:
+            raise ValueError("prompt exceeds the 128 KiB limit")
+        if not req.get("dest"):
+            raise ValueError("dest is required")
+        width = int(req["width"])
+        height = int(req["height"])
+        steps = int(req["steps"])
+        if width < 128 or height < 128 or width > 2048 or height > 2048 or width % 16 or height % 16:
+            raise ValueError("Qwen width and height must be multiples of 16 within 128-2048")
+        if width * height > 589824:
+            raise ValueError("Qwen-Image 2.1 is limited to 589824 pixels on 16GB Apple Silicon")
+        if steps < 1 or steps > 50:
+            raise ValueError("steps must be between 1 and 50")
+        negative = str(req.get("negative_prompt") or "")
+        if len(negative.encode("utf-8")) > _MAX_PROMPT_BYTES:
+            raise ValueError("negative prompt exceeds the 128 KiB limit")
+        guidance = req.get("guidance")
+        eff_guidance = 1.0 if guidance is None else float(guidance)
+        if not math.isfinite(eff_guidance) or eff_guidance < 0:
+            raise ValueError("guidance must be a finite non-negative number")
+        if negative and eff_guidance <= 1.0:
+            eff_guidance = 3.0
+        sampler_label = str(req.get("sampler") or "linear").lower()
+        if sampler_label not in QWEN_SCHEDULERS:
+            raise ValueError(f"unsupported Qwen sampler: {sampler_label}")
+        scheduler = QWEN_SCHEDULERS[sampler_label]
+        seed = req.get("seed")
+        if seed is None:
+            seed = int(time.time())
+        refs = [Path(p) for p in (req.get("ref_paths") or []) if p]
+        if len(refs) > 1:
+            raise ValueError("Qwen-Image 2.1 accepts at most one reference image")
+        image_strength = req.get("image_strength")
+        if image_strength is not None and not 0.0 < float(image_strength) <= 1.0:
+            raise ValueError("image_strength must be in the interval (0, 1]")
+        quantization = int(req.get("quantization", 4))
+        if quantization != 4:
+            raise ValueError("Qwen-Image 2.1 supports only 4-bit quantization")
+    except (KeyError, TypeError, ValueError) as e:
+        emit({"error": f"invalid request: {e}"})
+        return 2
 
-    prompt = req["prompt"]
-    negative = req.get("negative_prompt") or ""
-    guidance = req.get("guidance")
-    if guidance is None:
-        guidance = 1.0
-    eff_guidance = guidance
-    if negative and eff_guidance <= 1.0:
-        eff_guidance = 3.0
-    scheduler = QWEN_SCHEDULERS.get((req.get("sampler") or "linear").lower(), "linear")
-    seed = req.get("seed")
-    if seed is None:
-        seed = int(time.time())
-    refs = [Path(p) for p in (req.get("ref_paths") or []) if p]
+    set_limit = getattr(mx, "set_wired_limit", None) or mx.metal.set_wired_limit
+    set_limit(_wired_budget(req.get("wired_limit_bytes")))
+
+    pipe = None
+
+    def phase(ph, detail=""):
+        emit({"phase": ph, "detail": detail})
+
+    def _handle_signal(signum, frame):
+        raise KeyboardInterrupt
+
+    old_handlers = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            old_handlers[signum] = signal.signal(signum, _handle_signal)
+        except (ValueError, OSError):
+            pass
 
     try:
+        if req.get("phase_cb"):
+            phase("loading_model", "Loading Qwen-Image-2.1 4-bit pipeline into unified memory...")
         t0 = time.time()
-        pipe = QwenImage21(quantize=4, model_path=req.get("model_path") or MODEL)
+        model_path = req.get("model_path") or MODEL
+        pipe = QwenImage21(quantize=quantization, model_path=str(model_path))
+        pipe.prompt_cache = _BoundedPromptCache(pipe.prompt_cache)
         load_time = time.time() - t0
+
+        needs_tiling = bool(refs) or max(width, height) > 512
+        if needs_tiling:
+            pipe.tiling_config = TilingConfig(
+                vae_decode_tiles_per_dim=2,
+                vae_decode_tile_size=512,
+                vae_decode_overlap=8,
+                vae_encode_tiled=bool(refs),
+                vae_encode_tile_size=512,
+                vae_encode_tile_overlap=64,
+            )
+        else:
+            pipe.tiling_config = None
+
+        if not bool(req.get("fast_vae", True)) and hasattr(pipe, "vae") and hasattr(pipe.vae, "decoder"):
+            try:
+                pipe.vae.decoder = mx.compile(pipe.vae.decoder)
+            except Exception:
+                pass
 
         if os.environ.get("QWEN_ENGINE_DIAG"):
             from mflux.models.common.config.config import Config as _Config
@@ -131,7 +237,7 @@ def main() -> int:
             _tok_emb = te.embed_tokens(_ids.astype(mx.int32))
             mx.eval(_tok_emb)
             _fingerprint("tok_emb_for_tokens", _tok_emb)
-            _lat = _LC.create_noise(seed, int(req["height"]), int(req["width"]))
+            _lat = _LC.create_noise(seed, height, width)
             _lat = _lat.astype(_MC.precision)
             mx.eval(_lat)
             _fingerprint("noise", _lat)
@@ -146,9 +252,9 @@ def main() -> int:
             mx.eval(_msk)
             _fingerprint("text_mask", _msk.astype(mx.float32))
             _cfg = _Config(
-                width=int(req["width"]), height=int(req["height"]), guidance=eff_guidance,
+                width=width, height=height, guidance=eff_guidance,
                 scheduler=scheduler, image_path=None, image_strength=None,
-                model_config=_MC.qwen_image_21(), num_inference_steps=int(req["steps"]),
+                model_config=_MC.qwen_image_21(), num_inference_steps=steps,
             )
             _t0 = next(iter(_cfg.time_steps))
             _o = pipe.transformer(
@@ -159,16 +265,6 @@ def main() -> int:
             mx.eval(_o)
             _fingerprint("transformer_first_step_out", _o)
 
-        def phase(ph, detail=""):
-            emit({"phase": ph, "detail": detail})
-
-        if req.get("phase_cb"):
-            phase("loading_model", "Loading Qwen-Image-2.1 4-bit pipeline into unified memory...")
-
-        fast_vae = bool(req.get("fast_vae", True))
-        if not fast_vae and hasattr(pipe, "vae"):
-            pipe.vae.decoder = mx.compile(pipe.vae.decoder)
-
         step_cb = _StepCB(phase_cb=(lambda ph, d: phase(ph, d)) if req.get("phase_cb") else None)
         pipe.callbacks.in_loop = [step_cb]
         pipe.callbacks.before_loop = [step_cb]
@@ -178,25 +274,41 @@ def main() -> int:
         out = pipe.generate_image(
             seed=seed,
             prompt=prompt,
-            num_inference_steps=int(req["steps"]),
-            height=int(req["height"]),
-            width=int(req["width"]),
+            num_inference_steps=steps,
+            height=height,
+            width=width,
             guidance=eff_guidance,
             image_path=refs[0] if refs else None,
-            image_strength=req.get("image_strength"),
+            image_strength=image_strength,
             negative_prompt=negative or None,
             scheduler=scheduler,
         )
         infer_time = round(time.time() - t1, 2)
-        out.image.save(req["dest"])
+        dest = Path(req["dest"])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            out.image.save(dest)
+        except Exception:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise
         emit({
             "generation_time": infer_time,
             "load_time": round(load_time, 2),
-            "steps": int(req["steps"]),
-            "sampler": scheduler,
+            "steps": steps,
+            "sampler": sampler_label,
+            "scheduler": scheduler,
+            "guidance": eff_guidance,
+            "width": width,
+            "height": height,
+            "quantization": quantization,
+            "model_path": str(model_path),
+            "tiled_vae": bool(pipe.tiling_config),
         })
         return 0
-    except Exception as e:
+    except (Exception, KeyboardInterrupt) as e:
         try:
             import traceback
             traceback.print_exc(file=sys.stderr)
@@ -204,6 +316,23 @@ def main() -> int:
             pass
         emit({"error": f"{type(e).__name__}: {e}"})
         return 1
+    finally:
+        for signum, handler in old_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                pass
+        if pipe is not None:
+            try:
+                pipe.prompt_cache.clear()
+            except Exception:
+                pass
+        pipe = None
+        gc.collect()
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

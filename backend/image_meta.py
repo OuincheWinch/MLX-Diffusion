@@ -13,8 +13,89 @@ from PIL.PngImagePlugin import PngInfo
 import app_settings
 
 
+_EXPORTABLE_PNG_FIELDS = (
+    "prompt",
+    "negative_prompt",
+    "sampler",
+    "width",
+    "height",
+    "steps",
+    "guidance",
+    "seed",
+    "quantization",
+    "generation_time",
+    "load_time",
+    "created_at",
+    "format",
+    "fast_vae",
+    "cache_interval",
+    "reference_strength",
+    "upscale_factor",
+    "upscale_method",
+    "modelVersionName",
+    "modelVersionId",
+    "modelId",
+)
+
+
 def _artist_fallback(artist_value) -> str:
     return artist_value or app_settings.metadata_artist()
+
+
+def _is_local_path(value) -> bool:
+    text = str(value or "").strip()
+    return text.startswith(("/", "~", "./", "../", "file://")) or bool(
+        re.match(r"^[A-Za-z]:[\\/]", text)
+    )
+
+
+def _public_name(value, fallback: str) -> str:
+    text = str(value or "").strip()
+    return fallback if not text or _is_local_path(text) else text
+
+
+def _fsync_parent(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def atomic_write_json(
+    path: Path,
+    data,
+    *,
+    indent: int | None = 2,
+    sort_keys: bool = False,
+    ensure_ascii: bool = False,
+) -> None:
+    path = Path(path)
+    payload = json.dumps(
+        data,
+        indent=indent,
+        sort_keys=sort_keys,
+        ensure_ascii=ensure_ascii,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=f".{path.name}.tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_parent(path.parent)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
 
 
 def compute_aspect_ratio(w: int, h: int) -> str:
@@ -87,12 +168,21 @@ def build_generation_metadata_text(meta: dict) -> str:
     if model_name:
         try:
             from generator import get_model_info
-            minfo = get_model_info(model_name)
+            minfo = get_model_info(model_name) or {}
         except Exception:
             minfo = {}
 
-    model_civitai_name = minfo.get("civitai_model_name") or meta.get("model_label") or minfo.get("label") or model_name or "MLX-Model"
-    model_version_name = minfo.get("civitai_version_name") or meta.get("modelVersionName") or "v1.0"
+    model_civitai_name = _public_name(
+        minfo.get("civitai_model_name")
+        or meta.get("model_label")
+        or minfo.get("label")
+        or model_name,
+        "MLX-Model",
+    )
+    model_version_name = _public_name(
+        minfo.get("civitai_version_name") or meta.get("modelVersionName"),
+        "v1.0",
+    )
     chk_vid = minfo.get("civitai_version_id") or meta.get("modelVersionId")
     chk_mid = minfo.get("civitai_model_id") or meta.get("modelId")
     chk_hash = (minfo.get("sha256", "")[:10] if minfo.get("sha256") else "") or (str(chk_vid) if chk_vid else "")
@@ -114,18 +204,30 @@ def build_generation_metadata_text(meta: dict) -> str:
     if chk_mid:
         civitai_resources[0]["modelId"] = chk_mid
 
-    for lora in meta.get("loras", []):
+    used_tag_names = set()
+    for index, lora in enumerate(meta.get("loras", []), 1):
         if not isinstance(lora, dict):
             continue
-        raw_path = lora.get("path", "")
-        raw_name = lora.get("name") or (Path(raw_path).stem if raw_path else "lora")
-        tag_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw_name).strip("_") or "lora"
+        raw_name = _public_name(
+            lora.get("civitai_model_name") or lora.get("name"),
+            f"lora_{index}",
+        )
+        base_tag_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw_name).strip("_") or f"lora_{index}"
+        tag_name = base_tag_name
+        suffix = 2
+        while tag_name in used_tag_names:
+            tag_name = f"{base_tag_name}_{suffix}"
+            suffix += 1
+        used_tag_names.add(tag_name)
         scale = float(lora.get("scale", 1.0))
         if f"<lora:{tag_name}" not in prompt and f"<lora:{raw_name}" not in prompt:
             prompt = f"{prompt}, <lora:{tag_name}:{scale}>" if prompt else f"<lora:{tag_name}:{scale}>"
 
-        l_name = lora.get("civitai_model_name") or raw_name
-        l_vname = lora.get("civitai_version_name") or lora.get("modelVersionName") or "v1.0"
+        l_name = _public_name(lora.get("civitai_model_name") or raw_name, "LoRA")
+        l_vname = _public_name(
+            lora.get("civitai_version_name") or lora.get("modelVersionName"),
+            "v1.0",
+        )
         l_vid = lora.get("modelVersionId") or lora.get("civitai_version_id")
         l_mid = lora.get("modelId") or lora.get("civitai_model_id")
         l_hash = (
@@ -333,10 +435,17 @@ def build_pnginfo(meta: dict, metadata_text: str | None = None) -> PngInfo:
     artist_clean = to_latin1_clean(_artist_fallback(meta.get("artist")))
     info.add_text("Artist", artist_clean)
     info.add_text("artist", artist_clean)
-    for k, v in meta.items():
-        if k not in ("id", "tags", "file", "stealth", "software", "artist", "generator", "Software", "Artist", "Generator"):
-            val_str = json.dumps(v) if isinstance(v, (list, dict)) else str(v)
-            info.add_text(k, to_latin1_clean(val_str))
+    public_model = _public_name(
+        meta.get("model_label") or meta.get("model"),
+        "MLX-Model",
+    )
+    info.add_text("model", to_latin1_clean(public_model))
+    for key in _EXPORTABLE_PNG_FIELDS:
+        if key not in meta or meta[key] is None:
+            continue
+        value = meta[key]
+        val_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+        info.add_text(key, to_latin1_clean(val_str))
     return info
 
 
@@ -389,12 +498,14 @@ def save_image_with_metadata(
                 os.fsync(f.fileno())
             try:
                 os.replace(tmp_path, dest_path)
-            except OSError as ex:
-                if ex.errno == 18:
-                    import shutil
-                    shutil.move(tmp_path, dest_path)
-                else:
-                    raise
+                _fsync_parent(target_dir)
+            except Exception:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                raise
             return
         except PermissionError as e:
             last_err = e
@@ -404,6 +515,13 @@ def save_image_with_metadata(
                 except OSError:
                     pass
             time.sleep(1.5 * (i + 1))
+        except Exception:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
     raise RuntimeError(
         f"Failed to save image to {dest_path} after {attempts} attempts "
         f"(external drive asleep/disconnected or macOS blocked access): {last_err}"

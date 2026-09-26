@@ -7,26 +7,40 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import generator
 import civitai_service
 
 # Directories & Files
-DATA_DIR = generator.DATA_DIR
-GENERATED_DIR = generator.GENERATED_DIR
-LORA_FILES_DIR = DATA_DIR / "lora_files"
-LORA_FILES_DIR.mkdir(parents=True, exist_ok=True)
+def _ensure_private_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+DATA_DIR = _ensure_private_dir(generator.DATA_DIR)
+ASSET_DIR = _ensure_private_dir(generator.ASSET_DIR)
+GENERATED_DIR = _ensure_private_dir(generator.GENERATED_DIR)
+LORA_FILES_DIR = _ensure_private_dir(ASSET_DIR / "lora_files")
 LORAS_FILE = DATA_DIR / "loras.json"
-SDXL_LORA_DIR = DATA_DIR / "SDXL"
-SDXL_LORA_DIR.mkdir(parents=True, exist_ok=True)
-UPLOADS_DIR = DATA_DIR / "uploads"
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+SDXL_LORA_DIR = _ensure_private_dir(ASSET_DIR / "SDXL")
+UPLOADS_DIR = _ensure_private_dir(DATA_DIR / "uploads")
 
 # Validation & Limits
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-MAX_LORA_UPLOAD_BYTES = 8 * (1 << 30)  # 8 GB
+SAFE_REF_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+SAFE_LORA_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._/-]*)?$")
+MAX_LORA_UPLOAD_BYTES = 8 * (1 << 30)
+MAX_REFERENCE_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_RUNTIME_JSON_BYTES = 64 * 1024 * 1024
+MAX_METADATA_BYTES = 8 * 1024 * 1024
+SUPPORTED_REFERENCE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 _KNOWN_TRIGGERS = {
@@ -35,19 +49,34 @@ _KNOWN_TRIGGERS = {
 
 
 def _validate_image_id(image_id: str) -> str:
-    if not SAFE_ID_RE.match(image_id):
+    if not isinstance(image_id, str) or not SAFE_ID_RE.fullmatch(image_id) or len(image_id) > 128:
         raise HTTPException(400, "invalid id")
     return image_id
 
 
 def _atomic_write_text(path: Path, text: str):
+    _ensure_private_dir(path.parent)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            try:
+                fchmod(fd, 0o600)
+            except OSError:
+                pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     except Exception:
         if os.path.exists(tmp):
             try:
@@ -58,44 +87,134 @@ def _atomic_write_text(path: Path, text: str):
 
 
 def _sanitize_component(value: str) -> str:
-    cleaned = _SAFE_NAME_RE.sub("_", value.strip())
+    cleaned = _SAFE_NAME_RE.sub("_", str(value or "").strip())
     return cleaned.strip("._")[:80]
 
 
+def _sanitize_filename(value: str, fallback: str = "download.safetensors") -> str:
+    raw = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = _sanitize_component(raw)
+    if not cleaned or cleaned in (".", ".."):
+        cleaned = _sanitize_component(fallback) or "download.safetensors"
+    if not cleaned.lower().endswith(".safetensors"):
+        cleaned = f"{cleaned[:150]}.safetensors"
+    return cleaned[:180]
+
+
 def _validate_lora_path(path: str) -> str | None:
-    """Return error message, or None if acceptable.
-    Absolute paths must point to existing .safetensors file; else treated as HF repo id."""
-    p = Path(path).expanduser()
+    if not isinstance(path, str) or not path.strip() or len(path) > 4096 or "\x00" in path:
+        return "invalid LoRA path"
+    value = path.strip()
+    try:
+        p = Path(value).expanduser()
+    except (OSError, RuntimeError):
+        return "invalid LoRA path"
     if not p.is_absolute():
+        if not SAFE_LORA_ID_RE.fullmatch(value) or any(part in (".", "..") for part in value.replace(":", "/").split("/")):
+            return "LoRA must be an existing .safetensors file or a valid Hugging Face repo id"
         return None
     try:
         resolved = p.resolve()
         if not resolved.exists():
-            return f"LoRA file not found: {path}"
+            return f"LoRA file not found: {value}"
         if not resolved.is_file():
-            return f"LoRA path is not a file: {path}"
+            return "LoRA path is not a file"
         if not resolved.name.lower().endswith(".safetensors"):
             return "only .safetensors files are supported"
+        if resolved.stat().st_size > MAX_LORA_UPLOAD_BYTES:
+            return "LoRA file exceeds the 8 GB limit"
+        if not civitai_service.is_valid_safetensors(resolved):
+            return "LoRA file is not a valid .safetensors archive"
         return None
-    except Exception as e:
-        return f"Invalid LoRA path: {e}"
+    except OSError:
+        return "LoRA file is not readable"
+
+
+def _validate_reference_images(reference_images: list[str]) -> list[str]:
+    if len(reference_images) > 10:
+        raise HTTPException(400, "a maximum of 10 reference images is allowed")
+    roots = (GENERATED_DIR.resolve(), UPLOADS_DIR.resolve())
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in reference_images:
+        if not isinstance(value, str) or not value.strip() or len(value) > 4096 or "\x00" in value:
+            raise HTTPException(400, "invalid reference image path")
+        raw = value.strip()
+        try:
+            candidate = Path(raw).expanduser()
+            if candidate.is_absolute():
+                resolved = candidate.resolve()
+                if not any(resolved.is_relative_to(root) for root in roots):
+                    raise HTTPException(400, "reference image is outside the gallery and uploads directories")
+            else:
+                if not SAFE_REF_NAME_RE.fullmatch(raw):
+                    raise HTTPException(400, "invalid reference image name")
+                names = [raw]
+                if not Path(raw).suffix:
+                    names.extend(f"{raw}{ext}" for ext in SUPPORTED_REFERENCE_EXTENSIONS)
+                resolved = None
+                for root in roots:
+                    for name in names:
+                        option = (root / name).resolve()
+                        if option.is_file() and option.is_relative_to(root):
+                            resolved = option
+                            break
+                    if resolved:
+                        break
+                if resolved is None:
+                    raise HTTPException(400, f"reference image not found: {raw}")
+        except HTTPException:
+            raise
+        except (OSError, RuntimeError) as e:
+            raise HTTPException(400, "invalid reference image path") from e
+        if not resolved.is_file() or resolved.suffix.lower() not in SUPPORTED_REFERENCE_EXTENSIONS:
+            raise HTTPException(400, f"unsupported reference image: {raw}")
+        value = str(resolved)
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    return normalized
 
 
 # --- Gallery Index ---
 _gallery_lock = threading.Lock()
+_IMAGE_MUTATION_LOCK = threading.RLock()
+_IMAGE_TOMBSTONES: set[str] = set()
 GALLERY_INDEX: dict[str, dict] = {}
 
 
+def _image_is_deleted(image_id: str) -> bool:
+    return image_id in _IMAGE_TOMBSTONES
+
+
+def _mark_image_deleted(image_id: str):
+    _IMAGE_TOMBSTONES.add(image_id)
+
+
+def _unmark_image_deleted(image_id: str):
+    _IMAGE_TOMBSTONES.discard(image_id)
+
+
 def _init_gallery_index():
+    valid_entries = []
+    for jf in GENERATED_DIR.glob("*.json"):
+        try:
+            if not jf.resolve().is_relative_to(GENERATED_DIR.resolve()):
+                continue
+            if jf.stat().st_size > MAX_METADATA_BYTES:
+                continue
+            data = json.loads(jf.read_text(encoding="utf-8"))
+            image_id = data.get("id") if isinstance(data, dict) else None
+            if not isinstance(image_id, str) or not SAFE_ID_RE.fullmatch(image_id) or len(image_id) > 128:
+                continue
+            if jf.stem != image_id:
+                continue
+            valid_entries.append((image_id, data))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
     with _gallery_lock:
         GALLERY_INDEX.clear()
-        for jf in GENERATED_DIR.glob("*.json"):
-            try:
-                data = json.loads(jf.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "id" in data:
-                    GALLERY_INDEX[data["id"]] = data
-            except Exception:
-                continue
+        GALLERY_INDEX.update(valid_entries)
 
 
 
@@ -106,38 +225,41 @@ MAX_QUEUED_IMAGES = 512
 
 # --- Pydantic Request Models ---
 class LoRA(BaseModel):
-    path: str
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    path: str = Field(min_length=1, max_length=4096)
     scale: float = Field(default=1.0, ge=0.0, le=10.0)
 
 
 class GenerateRequest(BaseModel):
-    prompt: str
-    model: str = generator.DEFAULT_MODEL_ID
-    width: int = Field(default=1024, ge=256, le=2048)
-    height: int = Field(default=1024, ge=256, le=2048)
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    prompt: str = Field(min_length=1, max_length=100_000)
+    model: str = Field(default=generator.DEFAULT_MODEL_ID, min_length=1, max_length=200)
+    width: int = Field(default=1024, ge=128, le=2048)
+    height: int = Field(default=1024, ge=128, le=2048)
     steps: int = Field(default=4, ge=1, le=50)
     guidance: float | None = Field(default=None, ge=0.0, le=10.0)
-    seed: int | None = None
-    quantization: int = 4
+    seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
+    quantization: Literal[4, 8] = 4
     loras: list[LoRA] = Field(default_factory=list, max_length=MAX_LORAS)
     batch: int = Field(default=1, ge=1, le=16)
-    negative_prompt: str = ""
-    sampler: str | None = None
+    negative_prompt: str = Field(default="", max_length=100_000)
+    sampler: str | None = Field(default=None, min_length=1, max_length=80)
     cache_interval: int = Field(default=1, ge=1, le=10)
-    reference_images: list[str] = []
-    reference_strength: float | None = None
-    output_format: str = "png"
+    reference_images: list[str] = Field(default_factory=list, max_length=10)
+    reference_strength: float | None = Field(default=None, gt=0.0, le=1.0)
+    output_format: Literal["png", "jpeg", "jpg"] = "png"
     stealth: bool = False
     fast_vae: bool = True
     max_pixels: int | None = Field(default=None, ge=256 * 256, le=2048 * 2048)
 
 
 class TokenRequest(BaseModel):
-    token: str
+    model_config = ConfigDict(extra="forbid")
+    token: str = Field(default="", max_length=4096)
 
 
 # --- Jobs & Generation Queue ---
-_JOBS_LOCK = threading.Lock()
+_JOBS_LOCK = threading.RLock()
 _JOBS_TTL_SECONDS = 3600
 _MAX_FINISHED_JOBS = 50
 
@@ -164,81 +286,192 @@ def _prune_jobs():
 # --- Queue Recovery & Crash Resilience ---
 QUEUE_RECOVERY_FILE = DATA_DIR / "queue_recovery.json"
 PENDING_QUEUE_FILE = DATA_DIR / "pending_queue.json"
-_RECOVERY_LOCK = threading.Lock()
+_RECOVERY_LOCK = threading.RLock()
+_MAX_PENDING_RECORDS = 512
 _MAX_RECOVERABLE_RECORDS = 100
+_RECOVERY_TOMBSTONES: set[str] = set()
 
 
 def _load_json_list(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
+    if path.exists():
+        try:
+            resolved = path.resolve()
+            size = path.stat().st_size
+        except OSError:
+            return []
+        if not resolved.is_relative_to(DATA_DIR.resolve()) or size > MAX_RUNTIME_JSON_BYTES:
+            raise ValueError(f"{path.name} exceeds the runtime state size limit")
     try:
+        if not path.exists():
+            return []
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return data
-    except Exception as e:
+            return [item for item in data if isinstance(item, dict)]
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
         print(f"[queue_recovery] warning loading {path.name}: {e}")
     return []
 
 
 def _save_json_list(path: Path, data: list[dict]):
+    payload = json.dumps(data, indent=2, allow_nan=False)
+    if len(payload.encode("utf-8")) > MAX_RUNTIME_JSON_BYTES:
+        raise ValueError(f"{path.name} exceeds the runtime state size limit")
+    _atomic_write_text(path, payload)
+
+
+def _validated_request(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
     try:
-        _atomic_write_text(path, json.dumps(data, indent=2))
-    except Exception as e:
-        print(f"[queue_recovery] error saving {path.name}: {e}")
+        return GenerateRequest.model_validate(value).model_dump()
+    except Exception:
+        return None
+
+
+def _validated_pending(items: list[dict]) -> list[dict]:
+    valid = []
+    seen = set()
+    for item in items:
+        job_id = item.get("id")
+        request = _validated_request(item.get("request"))
+        timestamp = item.get("enqueued_at")
+        if not isinstance(job_id, str) or not SAFE_ID_RE.fullmatch(job_id) or job_id in seen or request is None:
+            continue
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool) or not 0 < timestamp < time.time() + 86400:
+            timestamp = time.time()
+        seen.add(job_id)
+        valid.append({"id": job_id, "request": request, "enqueued_at": float(timestamp)})
+    return valid[-_MAX_PENDING_RECORDS:]
+
+
+def _validated_recoverable(items: list[dict]) -> list[dict]:
+    valid = []
+    seen = set()
+    for item in items:
+        job_id = item.get("id")
+        request = _validated_request(item.get("request"))
+        timestamp = item.get("timestamp")
+        if not isinstance(job_id, str) or not SAFE_ID_RE.fullmatch(job_id) or job_id in seen or request is None:
+            continue
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool) or not 0 < timestamp < time.time() + 86400:
+            timestamp = time.time()
+        reason = item.get("reason")
+        if not isinstance(reason, str) or not reason or len(reason) > 64:
+            reason = "cancelled"
+        seen.add(job_id)
+        valid.append({"id": job_id, "reason": reason, "timestamp": float(timestamp), "request": request})
+    return valid[:_MAX_RECOVERABLE_RECORDS]
+
+
+def _quarantine_recovery_file(path: Path) -> bool:
+    if not path.exists():
+        return True
+    quarantine = path.with_name(f"{path.name}.invalid.{time.time_ns()}")
+    try:
+        os.replace(path, quarantine)
+        return True
+    except OSError as e:
+        print(f"[queue_recovery] warning quarantining {path.name}: {e}")
+        return False
+
+
+def record_pending_jobs(records: list[tuple[str, dict]]):
+    if not records:
+        return
+    with _RECOVERY_LOCK:
+        raw_items = _load_json_list(PENDING_QUEUE_FILE)
+        items = _validated_pending(raw_items)
+        if len(items) != len(raw_items) and not _quarantine_recovery_file(PENDING_QUEUE_FILE):
+            raise OSError("could not quarantine invalid pending queue data")
+        for job_id, request_data in records:
+            if not isinstance(job_id, str) or not SAFE_ID_RE.fullmatch(job_id) or len(job_id) > 128:
+                raise ValueError("invalid pending job id")
+            if job_id in _RECOVERY_TOMBSTONES:
+                continue
+            pending = {
+                "id": job_id,
+                "request": _validated_request(request_data),
+                "enqueued_at": time.time(),
+            }
+            if pending["request"] is None:
+                raise ValueError("invalid pending job request")
+            items = [item for item in items if item["id"] != job_id]
+            items.append(pending)
+        _save_json_list(PENDING_QUEUE_FILE, _validated_pending(items))
 
 
 def record_pending_job(job_id: str, request_data: dict):
-    with _RECOVERY_LOCK:
-        items = _load_json_list(PENDING_QUEUE_FILE)
-        items = [x for x in items if x.get("id") != job_id]
-        items.append({
-            "id": job_id,
-            "request": request_data,
-            "enqueued_at": time.time(),
-        })
-        _save_json_list(PENDING_QUEUE_FILE, items)
+    record_pending_jobs([(job_id, request_data)])
 
 
-def remove_pending_job(job_id: str):
+def remove_pending_jobs(job_ids: set[str]):
+    if not job_ids:
+        return
     with _RECOVERY_LOCK:
-        items = _load_json_list(PENDING_QUEUE_FILE)
-        new_items = [x for x in items if x.get("id") != job_id]
+        raw_items = _load_json_list(PENDING_QUEUE_FILE)
+        items = _validated_pending(raw_items)
+        if len(items) != len(raw_items) and not _quarantine_recovery_file(PENDING_QUEUE_FILE):
+            raise OSError("could not quarantine invalid pending queue data")
+        new_items = [item for item in items if item["id"] not in job_ids]
         if len(new_items) != len(items):
             _save_json_list(PENDING_QUEUE_FILE, new_items)
 
 
-def record_recoverable_job(job_id: str, request_data: dict, reason: str = "cancelled"):
-    with _RECOVERY_LOCK:
-        # Remove from pending queue file
-        pend = _load_json_list(PENDING_QUEUE_FILE)
-        pend = [x for x in pend if x.get("id") != job_id]
-        _save_json_list(PENDING_QUEUE_FILE, pend)
+def remove_pending_job(job_id: str):
+    remove_pending_jobs({job_id})
 
-        # Add to recovery file
-        records = _load_json_list(QUEUE_RECOVERY_FILE)
-        records = [r for r in records if r.get("id") != job_id]
-        records.insert(0, {
-            "id": job_id,
-            "reason": reason,
-            "timestamp": time.time(),
-            "request": request_data,
-        })
-        _save_json_list(QUEUE_RECOVERY_FILE, records[:_MAX_RECOVERABLE_RECORDS])
+
+def record_recoverable_jobs(records: list[tuple[str, dict, str]]):
+    if not records:
+        return
+    with _RECOVERY_LOCK:
+        raw_archive = _load_json_list(QUEUE_RECOVERY_FILE)
+        archive = _validated_recoverable(raw_archive)
+        if len(archive) != len(raw_archive) and not _quarantine_recovery_file(QUEUE_RECOVERY_FILE):
+            raise OSError("could not quarantine invalid recovery data")
+        now = time.time()
+        for job_id, request_data, reason in records:
+            if job_id in _RECOVERY_TOMBSTONES:
+                continue
+            request = _validated_request(request_data)
+            if not isinstance(job_id, str) or not SAFE_ID_RE.fullmatch(job_id) or request is None:
+                raise ValueError("invalid recoverable job")
+            archive = [item for item in archive if item["id"] != job_id]
+            archive.insert(0, {"id": job_id, "reason": str(reason)[:64], "timestamp": now, "request": request})
+        _save_json_list(QUEUE_RECOVERY_FILE, _validated_recoverable(archive))
+        remove_pending_jobs({job_id for job_id, _, _ in records})
+
+
+def record_recoverable_job(job_id: str, request_data: dict, reason: str = "cancelled"):
+    record_recoverable_jobs([(job_id, request_data, reason)])
 
 
 def get_recoverable_jobs() -> list[dict]:
     with _RECOVERY_LOCK:
-        return _load_json_list(QUEUE_RECOVERY_FILE)
+        return [
+            item for item in _validated_recoverable(_load_json_list(QUEUE_RECOVERY_FILE))
+            if item.get("id") not in _RECOVERY_TOMBSTONES
+        ]
+
+
+def delete_recoverable_jobs(job_ids: set[str] | None):
+    with _RECOVERY_LOCK:
+        raw_records = _load_json_list(QUEUE_RECOVERY_FILE)
+        records = _validated_recoverable(raw_records)
+        if len(records) != len(raw_records) and not _quarantine_recovery_file(QUEUE_RECOVERY_FILE):
+            raise OSError("could not quarantine invalid recovery data")
+        if job_ids is None:
+            _RECOVERY_TOMBSTONES.update(str(record["id"]) for record in records)
+            new_records = []
+        else:
+            _RECOVERY_TOMBSTONES.update(str(job_id) for job_id in job_ids)
+            new_records = [record for record in records if record["id"] not in job_ids]
+        if new_records != records or job_ids is None:
+            _save_json_list(QUEUE_RECOVERY_FILE, new_records)
 
 
 def delete_recoverable_job(job_id: str | None = None):
-    with _RECOVERY_LOCK:
-        if job_id is None:
-            _save_json_list(QUEUE_RECOVERY_FILE, [])
-        else:
-            records = _load_json_list(QUEUE_RECOVERY_FILE)
-            records = [r for r in records if r.get("id") != job_id]
-            _save_json_list(QUEUE_RECOVERY_FILE, records)
+    delete_recoverable_jobs(None if job_id is None else {job_id})
 
 
 def clear_recoverable_jobs():
@@ -246,34 +479,59 @@ def clear_recoverable_jobs():
 
 
 def clear_recoverable_state():
-    """Clear the recovery archive AND the pending-queue file so nothing is
-    restored on next startup (clear & forget)."""
     with _RECOVERY_LOCK:
+        for item in _load_json_list(QUEUE_RECOVERY_FILE) + _load_json_list(PENDING_QUEUE_FILE):
+            job_id = item.get("id")
+            if isinstance(job_id, str) and SAFE_ID_RE.fullmatch(job_id):
+                _RECOVERY_TOMBSTONES.add(job_id)
         _save_json_list(QUEUE_RECOVERY_FILE, [])
         _save_json_list(PENDING_QUEUE_FILE, [])
 
 
 def _init_queue_recovery_on_startup():
-    """Detect crash / abrupt shutdown from previous session and migrate pending jobs to recovery."""
     with _RECOVERY_LOCK:
-        pending = _load_json_list(PENDING_QUEUE_FILE)
-        if pending:
-            records = _load_json_list(QUEUE_RECOVERY_FILE)
-            for item in pending:
-                records = [r for r in records if r.get("id") != item["id"]]
-                records.insert(0, {
-                    "id": item["id"],
-                    "reason": "interrupted",
-                    "timestamp": item.get("enqueued_at", time.time()),
-                    "interrupted_at": time.time(),
-                    "request": item.get("request", {}),
-                })
-            _save_json_list(QUEUE_RECOVERY_FILE, records[:_MAX_RECOVERABLE_RECORDS])
-            _save_json_list(PENDING_QUEUE_FILE, [])
-            print(f"[queue_recovery] Restored {len(pending)} interrupted jobs to recovery archive", flush=True)
+        raw_pending = _load_json_list(PENDING_QUEUE_FILE)
+        pending = _validated_pending(raw_pending)
+        if len(pending) != len(raw_pending) and not _quarantine_recovery_file(PENDING_QUEUE_FILE):
+            return
+        if not pending:
+            if raw_pending:
+                _save_json_list(PENDING_QUEUE_FILE, [])
+            return
+        raw_records = _load_json_list(QUEUE_RECOVERY_FILE)
+        records = _validated_recoverable(raw_records)
+        if len(records) != len(raw_records) and not _quarantine_recovery_file(QUEUE_RECOVERY_FILE):
+            return
+        for item in pending:
+            records = [record for record in records if record["id"] != item["id"]]
+            records.insert(0, {
+                "id": item["id"],
+                "reason": "interrupted",
+                "timestamp": item["enqueued_at"],
+                "interrupted_at": time.time(),
+                "request": item["request"],
+            })
+        _save_json_list(QUEUE_RECOVERY_FILE, _validated_recoverable(records))
+        _save_json_list(PENDING_QUEUE_FILE, [])
+        print(f"[queue_recovery] Restored {len(pending)} interrupted jobs to recovery archive", flush=True)
 
 
 _init_queue_recovery_on_startup()
+
+
+def _emit_generation_event(message: str):
+    event_log = os.environ.get("MLX_DIFFUSION_EVENT_LOG", "").strip()
+    if not event_log:
+        return
+    try:
+        with open(event_log, "a", encoding="utf-8") as stream:
+            stream.write(f"{message}\n")
+    except OSError:
+        pass
+
+
+def _generation_text(value: object, limit: int = 180) -> str:
+    return " ".join(str(value or "").split())[:limit] or "-"
 
 
 def _worker():
@@ -287,7 +545,14 @@ def _worker():
             with _JOBS_LOCK:
                 job = JOBS.get(job_id)
                 if job is None or job.get("status") == "cancelled":
-                    remove_pending_job(job_id)
+                    try:
+                        remove_pending_job(job_id)
+                        if job is not None:
+                            req = job.get("request")
+                            request_data = req.model_dump() if hasattr(req, "model_dump") else dict(req or {})
+                            record_recoverable_job(job_id, request_data, reason="cancelled")
+                    except Exception as e:
+                        print(f"[queue_recovery] error finalizing cancelled job {job_id}: {e}", flush=True)
                     continue
                 req = job["request"]
                 ref_imgs = list(req.reference_images)
@@ -295,7 +560,7 @@ def _worker():
                 is_loaded = generator.is_pipeline_loaded(
                     model_id=req.model,
                     quantization=req.quantization,
-                    loras=[l.model_dump() for l in req.loras],
+                    loras=[lora.model_dump() for lora in req.loras],
                     variant=variant,
                 )
                 job["status"] = "generating"
@@ -303,6 +568,16 @@ def _worker():
                 job["phase_detail"] = "Preparing prompt conditioning & latents..." if is_loaded else "Loading model weights into Apple Silicon unified memory..."
                 job["cancel_event"] = cancel_event
 
+            generation_started = time.monotonic()
+            generation_started_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            lora_summary = ",".join(Path(lora.path).name for lora in req.loras if lora.path) or "none"
+            _emit_generation_event(
+                f"[generation] START date={generation_started_at} job={job_id} model={req.model} "
+                f"size={req.width}x{req.height} steps={req.steps} seed={req.seed if req.seed is not None else 'auto'} "
+                f"batch={req.batch} guidance={req.guidance if req.guidance is not None else 'auto'} "
+                f"sampler={req.sampler or 'default'} quantization={req.quantization} "
+                f"loras={_generation_text(lora_summary, 240)} prompt={_generation_text(req.prompt)}"
+            )
             results = []
             status = "generating"
             try:
@@ -353,7 +628,7 @@ def _worker():
                         guidance=req.guidance,
                         seed=base_seed + 1024 * i,
                         quantization=req.quantization,
-                        loras=[l.model_dump() for l in req.loras],
+                        loras=[lora.model_dump() for lora in req.loras],
                         progress_cb=on_step,
                         phase_cb=on_phase,
                         cancel_event=cancel_event,
@@ -398,7 +673,11 @@ def _worker():
                     job["error"] = f"Interrupted: {type(be).__name__}"
                 generator._drop_mflux_pipeline()
             finally:
-                remove_pending_job(job_id)
+                try:
+                    remove_pending_job(job_id)
+                except Exception as e:
+                    print(f"[queue_recovery] error clearing pending job {job_id}: {e}", flush=True)
+                recovery_data = None
                 with _JOBS_LOCK:
                     job.pop("cancel_event", None)
                     if job.get("status") == "cancelled" or status == "cancelled":
@@ -406,7 +685,7 @@ def _worker():
                         if results:
                             job["partial_results"] = results
                         req_data = job["request"].model_dump() if hasattr(job.get("request"), "model_dump") else dict(job.get("request") or {})
-                        record_recoverable_job(job_id, req_data, reason="cancelled")
+                        recovery_data = req_data
                     elif status == "done" and results:
                         job["status"] = "done"
                         job["phase"] = "done"
@@ -425,6 +704,36 @@ def _worker():
                             job["partial_results"] = results
                     job["finished_at"] = time.time()
                     _prune_jobs()
+                    final_status = str(job.get("status") or status)
+                    error = str(job.get("error") or "").replace("\n", " ").strip()
+                    error_suffix = f" error={error[:160]}" if error else ""
+                    output_links = []
+                    generation_seconds = 0.0
+                    for result in results:
+                        if not isinstance(result, dict):
+                            continue
+                        try:
+                            generation_seconds += float(result.get("generation_time") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                        filename = result.get("file")
+                        if filename:
+                            try:
+                                output_links.append((Path(generator.GENERATED_DIR) / str(filename)).resolve().as_uri())
+                            except (OSError, ValueError):
+                                pass
+                    output_summary = ",".join(output_links) or "none"
+                    _emit_generation_event(
+                        f"[generation] END date={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} "
+                        f"job={job_id} model={req.model} status={final_status} "
+                        f"elapsed={time.monotonic() - generation_started:.1f}s generation_time={generation_seconds:.1f}s "
+                        f"images={len(results)} output={output_summary}{error_suffix}"
+                    )
+                if recovery_data is not None:
+                    try:
+                        record_recoverable_job(job_id, recovery_data, reason="cancelled")
+                    except Exception as e:
+                        print(f"[queue_recovery] error archiving job {job_id}: {e}", flush=True)
         except Exception as outer_be:
             print(f"[worker] critical job loop error: {outer_be}", flush=True)
             with _JOBS_LOCK:
@@ -441,23 +750,80 @@ threading.Thread(target=_worker, daemon=True).start()
 
 
 # --- LoRA Registry State & Helpers ---
-_loras_lock = threading.Lock()
+_loras_lock = threading.RLock()
+
+
+def _valid_registry_entry(entry: object) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    name = entry.get("name")
+    path = entry.get("path")
+    valid = (
+        isinstance(name, str)
+        and 0 < len(name) <= 200
+        and isinstance(path, str)
+        and 0 < len(path) <= 4096
+        and "\x00" not in path
+    )
+    if not valid:
+        return False
+    sha256 = entry.get("sha256")
+    if sha256 is not None and (not isinstance(sha256, str) or not sha256 or len(sha256) > 128 or any(ord(char) < 32 for char in sha256)):
+        return False
+    return True
 
 
 def _read_loras() -> list[dict]:
     with _loras_lock:
-        if LORAS_FILE.exists():
-            try:
-                return json.loads(LORAS_FILE.read_text(encoding="utf-8"))
-            except Exception:
+        try:
+            if not LORAS_FILE.exists():
                 return []
-        return []
+            if not LORAS_FILE.resolve().is_relative_to(DATA_DIR.resolve()) or LORAS_FILE.stat().st_size > MAX_RUNTIME_JSON_BYTES:
+                raise ValueError("LoRA registry exceeds the runtime state size limit")
+            data = json.loads(LORAS_FILE.read_text(encoding="utf-8"))
+        except ValueError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [dict(entry) for entry in data[:512] if _valid_registry_entry(entry)]
 
 
 def _write_loras(loras: list[dict]):
     with _loras_lock:
-        LORAS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(LORAS_FILE, json.dumps(loras, indent=2))
+        valid = [dict(entry) for entry in loras[:512] if _valid_registry_entry(entry)]
+        _ensure_private_dir(LORAS_FILE.parent)
+        _atomic_write_text(LORAS_FILE, json.dumps(valid, indent=2, allow_nan=False))
+
+
+def _upsert_lora_entries(entries: list[dict]):
+    with _loras_lock:
+        loras = _read_loras()
+        for entry in entries:
+            if not _valid_registry_entry(entry):
+                raise ValueError("invalid LoRA registry entry")
+            loras = [
+                item
+                for item in loras
+                if item.get("name") != entry.get("name") and item.get("path") != entry.get("path")
+            ]
+            loras.append(dict(entry))
+        _write_loras(loras)
+
+
+def _remove_lora_entries(names: set[str] | None = None, paths: set[str] | None = None):
+    names = names or set()
+    paths = paths or set()
+    if not names and not paths:
+        return []
+    with _loras_lock:
+        loras = _read_loras()
+        removed = [entry for entry in loras if entry.get("name") in names or entry.get("path") in paths]
+        remaining = [entry for entry in loras if entry not in removed]
+        if removed:
+            _write_loras(remaining)
+        return removed
 
 
 def _inspect_safetensors(path: Path) -> tuple[str | None, list[str]]:
@@ -465,10 +831,17 @@ def _inspect_safetensors(path: Path) -> tuple[str | None, list[str]]:
     if not civitai_service.is_valid_safetensors(path):
         return None, []
     try:
+        size = path.stat().st_size
         with open(path, "rb") as f:
             header_len_bytes = f.read(8)
+            if len(header_len_bytes) != 8:
+                return None, []
             header_len = struct.unpack("<Q", header_len_bytes)[0]
+            if header_len <= 0 or header_len > min(size - 8, 100 * 1024 * 1024):
+                return None, []
             header = json.loads(f.read(header_len).decode("utf-8"))
+            if not isinstance(header, dict):
+                return None, []
         meta = header.get("__metadata__", {})
         keys = [k for k in header.keys() if k != "__metadata__"]
 
@@ -568,36 +941,38 @@ def sync_lora_entry_with_civitai(entry: dict, force: bool = False) -> bool:
 
 
 def _discover_local_loras():
+    with _loras_lock:
+        return _discover_local_loras_locked()
+
+
+def _discover_local_loras_locked():
     """Register safetensors dropped into lora_files/ or SDXL/. Runs at startup and after uploads."""
     loras = _read_loras()
     changed = False
 
-    valid_loras = []
-    for l in loras:
-        p = Path(l.get("path", ""))
-        if not p.is_file() or not civitai_service.is_valid_safetensors(p):
-            print(f"[loras] Purging missing or invalid LoRA entry: {l.get('name')} ({p})", flush=True)
-            changed = True
-            continue
-        valid_loras.append(l)
-    loras = valid_loras
+    for lora in loras:
+        path = Path(lora.get("path", ""))
+        if path.is_absolute() and (not path.is_file() or not civitai_service.is_valid_safetensors(path)):
+            print(f"[loras] Retaining unavailable LoRA entry: {lora.get('name')} ({path})", flush=True)
 
-    for l in loras:
-        l.setdefault("triggers", [])
-        l.setdefault("base_model", "sdxl" if "SDXL" in l.get("path", "") or "sdxl" in l.get("name", "").lower() else "flux2")
-        if not l["triggers"]:
-            l["triggers"] = next(
-                (t for k, t in _KNOWN_TRIGGERS.items() if k in l["name"]), [])
-            if l["triggers"]:
+    for lora in loras:
+        lora.setdefault("triggers", [])
+        lora.setdefault("base_model", "sdxl" if "SDXL" in lora.get("path", "") or "sdxl" in lora.get("name", "").lower() else "flux2")
+        if not lora["triggers"]:
+            lora["triggers"] = next(
+                (trigger for key, trigger in _KNOWN_TRIGGERS.items() if key in lora["name"]), [])
+            if lora["triggers"]:
                 changed = True
-        if not l.get("civitai_version_id") or not l.get("sha256"):
-            if sync_lora_entry_with_civitai(l):
+        if not lora.get("civitai_version_id") or not lora.get("sha256"):
+            if sync_lora_entry_with_civitai(lora):
                 changed = True
 
-    known_paths = {l["path"] for l in loras}
-    known_names = {l["name"] for l in loras}
+    known_paths = {lora["path"] for lora in loras}
+    known_names = {lora["name"] for lora in loras}
     for folder in (LORA_FILES_DIR, SDXL_LORA_DIR):
         for f in sorted(folder.glob("*.safetensors")):
+            if not f.resolve().is_relative_to(folder.resolve()):
+                continue
             if "f42SDXL" in f.name or "Juggernaut" in f.name:
                 continue
             try:
@@ -621,16 +996,16 @@ def _discover_local_loras():
                 "triggers": triggers or next((t for k, t in _KNOWN_TRIGGERS.items() if k in name), []),
                 "base_model": base,
             }
-            old = next((l for l in loras if l["name"] == entry["name"]), None)
+            old = next((lora for lora in loras if lora["name"] == entry["name"]), None)
             if old and old.get("base_model"):
                 entry["base_model"] = old["base_model"]
             sync_lora_entry_with_civitai(entry)
-            loras = [l for l in loras if l["name"] != entry["name"]]
+            loras = [lora for lora in loras if lora["name"] != entry["name"]]
             loras.append(entry)
             known_paths.add(resolved)
             changed = True
     if changed:
-        _write_loras(loras)
+        _upsert_lora_entries(loras)
 
 
 

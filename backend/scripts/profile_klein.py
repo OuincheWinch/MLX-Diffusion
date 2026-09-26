@@ -1,29 +1,6 @@
 #!/usr/bin/env python3
-"""Task 64.1 — Phase profiler for FLUX.2-klein 4B (M1, mflux 0.19 / mlx 0.32).
-
-Measures, on a warm pipeline with the app's exact wraps (TAEF2 fast-VAE,
-Qwen3 prompt LRU cache, wired limit):
-  1. pipeline build/load     (first call, from HF cache)
-  2. prompt encoding         (cold canonical prompt)
-  3. latent preparation
-  4. per-step loop iteration (predict build + scheduler.step + mx.eval)
-  5. VAE decode              (TAEF2 fast path, as the app runs it)
-
-Every run stores the produced PNG in <repo>/test/ and appends the full
-generation parameters + timings to <repo>/test/manifest.json.
-
-Variants:
-  q4                : the app's current default (4-bit transformer + text encoder)
-  bf16-transformer  : timing-only proxy for an unquantized transformer (weights
-                      dequantized from q4 — GEMM cost is format-determined; use
-                      ONLY for timing, values are not the true bf16 weights)
-
-Usage:
-  ./venv/bin/python backend/scripts/profile_klein.py --resolution 768x768 --steps 4 --seed 1337
-  ./venv/bin/python backend/scripts/profile_klein.py --resolution 768x768 --variant bf16-transformer
-  ./venv/bin/python backend/scripts/profile_klein.py --resolution 1024x1024 --e2e
-"""
 import argparse
+import importlib.metadata
 import json
 import os
 import sys
@@ -45,6 +22,7 @@ TEST_DIR = PROJECT_ROOT / "test"
 TEST_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST = TEST_DIR / "manifest.json"
 
+from image_meta import atomic_write_json
 import generator  # reuse the app's exact pipeline construction & exotic wraps
 
 CANONICAL = (
@@ -80,6 +58,58 @@ MODELS = {
 }
 
 
+def _dependency_versions() -> dict:
+    names = ("mlx", "mflux", "mlx-lm", "mlx-taef", "mlx-teacache", "numpy", "pillow")
+    versions = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def _memory_snapshot() -> dict:
+    snapshot = {}
+    for key, name in (
+        ("active_bytes", "get_active_memory"),
+        ("peak_bytes", "get_peak_memory"),
+        ("cache_bytes", "get_cache_memory"),
+    ):
+        getter = getattr(mx, name, None) or getattr(mx.metal, name, None)
+        if getter:
+            snapshot[key] = int(getter())
+    return snapshot
+
+
+def _reset_peak_memory() -> None:
+    reset = getattr(mx, "reset_peak_memory", None) or getattr(mx.metal, "reset_peak_memory", None)
+    if reset:
+        reset()
+
+
+def _eval_value(value) -> None:
+    if isinstance(value, mx.array):
+        mx.eval(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _eval_value(item)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            _eval_value(item)
+
+
+def _phase_timings(events: list[tuple[str, float]], start: float, end: float) -> dict:
+    if not events:
+        return {"unattributed": round(max(0.0, end - start), 3)}
+    totals = {"unattributed_before_first_phase": round(max(0.0, events[0][1] - start), 3)}
+    for index, (phase, timestamp) in enumerate(events):
+        next_timestamp = events[index + 1][1] if index + 1 < len(events) else end
+        duration = max(0.0, next_timestamp - timestamp)
+        totals[phase] = round(totals.get(phase, 0.0) + duration, 3)
+    return totals
+
+
 def _record(run: dict) -> None:
     """Append one benchmark run to test/manifest.json (read-modify-write)."""
     runs = []
@@ -91,7 +121,7 @@ def _record(run: dict) -> None:
         except Exception:
             runs = []
     runs.append(run)
-    MANIFEST.write_text(json.dumps(runs, indent=2, ensure_ascii=False))
+    atomic_write_json(MANIFEST, runs, ensure_ascii=False)
     print(f"[manifest] {len(runs)} run(s) -> {MANIFEST}", flush=True)
 
 
@@ -144,6 +174,7 @@ def _save_png(decoded_nchw, path):
     """Mirror mflux ImageUtil.to_image pixel math for a bit-identical reference file."""
     x = mx.clip((decoded_nchw / 2 + 0.5), 0, 1)
     x = x[0].transpose(1, 2, 0).astype(mx.float32)
+    mx.eval(x)
     arr = np.array(x)
     img = (arr * 255).round().astype("uint8")
     Image.fromarray(img).save(str(path), format="PNG")
@@ -252,10 +283,14 @@ def profile_generic(model_id, width, height, steps, seed, no_cache, wired_gb):
     (app parity: fast-VAE wrap, wired limit, and — unless --no-cache — the rope memo
     + text-encoder LRU that generator now installs). Saves PNG + sidecar JSON to test/.
     """
+    _reset_peak_memory()
+    memory_before = _memory_snapshot()
+    expected_key = generator._make_pipeline_key(model_id, 4, [], variant="standard")
+    pipeline_cache = "warm" if getattr(generator, "_current_pipeline_key", None) == expected_key else "cold"
     t0 = time.perf_counter()
     pipe = generator._get_pipeline(model_id, 4, [], variant="standard")
     load_t = time.perf_counter() - t0
-    actual_wired = int(wired_gb * (1 << 30)) if wired_gb else generator._wired_limit_bytes()
+    actual_wired = int(wired_gb * (1 << 30)) if wired_gb is not None else generator._wired_limit_bytes()
     actual_wired = max(actual_wired, 0)
 
     taef_orig = _taef_wrap(pipe, model_id)
@@ -267,6 +302,7 @@ def profile_generic(model_id, width, height, steps, seed, no_cache, wired_gb):
         def enc(prompt, negative_prompt=None, guidance=1.0, **kw):
             t = time.perf_counter()
             r = orig_enc(prompt=prompt, negative_prompt=negative_prompt, guidance=guidance, **kw)
+            _eval_value(r)
             encode_times.append(time.perf_counter() - t)
             return r
 
@@ -278,6 +314,7 @@ def profile_generic(model_id, width, height, steps, seed, no_cache, wired_gb):
         def dec(*, latents, prompt, seed, **kw):
             t = time.perf_counter()
             r = orig_dec(latents=latents, prompt=prompt, seed=seed, **kw)
+            _eval_value(r)
             decode_times.append(time.perf_counter() - t)
             return r
 
@@ -294,6 +331,7 @@ def profile_generic(model_id, width, height, steps, seed, no_cache, wired_gb):
         )
         wall = time.perf_counter() - t
     finally:
+        pipe._encode_prompts = orig_enc
         if taef_orig is not None:
             pipe._decode_latents = taef_orig
 
@@ -304,11 +342,10 @@ def profile_generic(model_id, width, height, steps, seed, no_cache, wired_gb):
     img_path = TEST_DIR / img_name
     out.image.save(str(img_path), format="PNG")
 
+    memory_after = _memory_snapshot()
     encode_total = sum(encode_times)
     decode_total = sum(decode_times)
-    denoise = wall - encode_total - decode_total
-    sidesave = 0.0
-    iter_t = [round(encode_times[0], 3) if encode_times else 0.0]
+    generate_remainder = wall - encode_total - decode_total
     run = {
         "image": img_name,
         "model": model_id,
@@ -324,14 +361,18 @@ def profile_generic(model_id, width, height, steps, seed, no_cache, wired_gb):
         "wired_limit_gb": actual_wired / (1 << 30),
         "rope_memo": "off" if no_cache else "on",
         "prompt": MODELS[model_id]["prompt"],
-        "text_encoder_cache": "on",
+        "text_encoder_cache": "off" if no_cache else "on",
+        "pipeline_cache": pipeline_cache,
+        "dependencies": _dependency_versions(),
+        "memory": {"scope": "profile-process", "before": memory_before, "after": memory_after},
         "system_load": _sysload(),
         "generation_time": round(wall, 3),
+        "timing_scope": "generate_image wall time, excluding model load",
         "phases": {
             "model_load": round(load_t, 3),
-            "prompt_encode_cold": round(encode_times[0], 3) if encode_times else None,
-            "prompt_encode_repeat": round(sum(encode_times[1:]), 3),
-            "denoise_approx": round(denoise, 3),
+            "prompt_encode": round(encode_total, 3),
+            "prompt_encode_calls": len(encode_times),
+            "generate_remainder": round(generate_remainder, 3),
             "vae_decode_taef": round(decode_total, 3),
         },
         "created_at_utc": stamp,
@@ -341,8 +382,8 @@ def profile_generic(model_id, width, height, steps, seed, no_cache, wired_gb):
 
     print(f"\n== {model_id} | {width}x{height} | {steps} steps | seed {seed} | wired {actual_wired / (1 << 30)} GiB | rope_memo {run['rope_memo']} ==", flush=True)
     print(f"  model load/build     : {load_t:6.2f}s", flush=True)
-    print(f"  prompt encode (cold) : {encode_times[0]:6.2f}s" if encode_times else "", flush=True)
-    print(f"  generate_image wall  : {wall:6.2f}s  (encode {encode_total:5.2f} | denoise~ {denoise:5.2f} | decode {decode_total:5.2f})", flush=True)
+    print(f"  prompt encode        : {encode_times[0]:6.2f}s" if encode_times else "", flush=True)
+    print(f"  generate_image wall  : {wall:6.2f}s  (encode {encode_total:5.2f} | remainder {generate_remainder:5.2f} | decode {decode_total:5.2f})", flush=True)
     print(f"  image saved          : {img_path}", flush=True)
     return run
 
@@ -350,10 +391,14 @@ def profile_generic(model_id, width, height, steps, seed, no_cache, wired_gb):
 def profile(width, height, steps, seed, variant="q4", wired_gb=None, no_cache=False):
     if no_cache:
         os.environ["MLX_DISABLE_ROPE_CACHE"] = "1"
+    _reset_peak_memory()
+    memory_before = _memory_snapshot()
+    expected_key = generator._make_pipeline_key("flux2-klein-4b", 4, [], variant="standard")
+    pipeline_cache = "warm" if getattr(generator, "_current_pipeline_key", None) == expected_key else "cold"
     t0 = time.perf_counter()
     pipe = generator._get_pipeline("flux2-klein-4b", 4, [], variant="standard")
     load_t = time.perf_counter() - t0
-    actual_wired = int(wired_gb * (1 << 30)) if wired_gb else generator._wired_limit_bytes()
+    actual_wired = int(wired_gb * (1 << 30)) if wired_gb is not None else generator._wired_limit_bytes()
 
     if variant == "bf16-transformer":
         _bf16_transformer(pipe)
@@ -379,12 +424,12 @@ def profile(width, height, steps, seed, variant="q4", wired_gb=None, no_cache=Fa
     prompt_embeds, text_ids, negative_prompt_embeds, negative_text_ids = pipe._encode_prompt_pair(
         prompt=CANONICAL, negative_prompt=" ", guidance=1.0
     )
-    mx.eval(prompt_embeds, text_ids)
+    mx.eval(prompt_embeds, text_ids, negative_prompt_embeds, negative_text_ids)
     encode_t = time.perf_counter() - t
 
     t = time.perf_counter()
     latents, latent_ids, latent_height, latent_width = pipe._prepare_generation_latents(seed=seed, config=cfg)
-    mx.eval(latents)
+    mx.eval(latents, latent_ids)
     lat_t = time.perf_counter() - t
 
     predict = pipe._predict(pipe.transformer)
@@ -418,6 +463,7 @@ def profile(width, height, steps, seed, variant="q4", wired_gb=None, no_cache=Fa
     decoded = pipe.vae.decode_packed_latents(packed)
     mx.eval(decoded)
     decode_t = time.perf_counter() - t
+    memory_after = _memory_snapshot()
 
     # store image + manifest entry, always
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -451,8 +497,13 @@ def profile(width, height, steps, seed, variant="q4", wired_gb=None, no_cache=Fa
         "wired_limit_gb": actual_wired / (1 << 30),
         "rope_memo": "off" if no_cache else "on",
         "prompt": CANONICAL,
+        "text_encoder_cache": "off" if no_cache else "on",
+        "pipeline_cache": pipeline_cache,
+        "dependencies": _dependency_versions(),
+        "memory": {"scope": "profile-process", "before": memory_before, "after": memory_after},
         "system_load": _sysload(),
         "generation_time": round(gen_total, 3),
+        "timing_scope": "encode + latent prep + denoise + decode, excluding model load and image save",
         "phases": {
             "model_load": round(load_t, 3),
             "prompt_encode_cold": round(encode_t, 3),
@@ -499,80 +550,97 @@ def main():
     w, h = (int(v) for v in res.lower().split("x"))
     if args.no_cache:
         os.environ["MLX_DISABLE_ROPE_CACHE"] = "1"
+    if args.wired_gb is not None and args.wired_gb < 0:
+        raise SystemExit("--wired-gb must be >= 0")
     prev = _set_wired_like_app(override_gb=args.wired_gb)
-    if args.model == "flux2-klein-4b":
-        profile(w, h, steps, args.seed, variant=args.variant, wired_gb=args.wired_gb, no_cache=args.no_cache)
-    else:
-        profile_generic(args.model, w, h, steps, args.seed, args.no_cache, args.wired_gb)
-    if prev is not None:
-        set_limit = getattr(mx, "set_wired_limit", None) or mx.metal.set_wired_limit
-        set_limit(prev)
+    try:
+        if args.model == "flux2-klein-4b":
+            profile(w, h, steps, args.seed, variant=args.variant, wired_gb=args.wired_gb, no_cache=args.no_cache)
+        else:
+            profile_generic(args.model, w, h, steps, args.seed, args.no_cache, args.wired_gb)
 
-    if args.e2e:
-        phase_times = {}
+        if args.e2e:
+            generator._drop_mflux_pipeline()
+            _reset_peak_memory()
+            memory_before = _memory_snapshot()
+            phase_events = []
 
-        def phase_cb(phase, msg=None):
-            phase_times[phase] = time.perf_counter()
+            def phase_cb(phase, msg=None):
+                phase_events.append((phase, time.perf_counter()))
 
-        t0 = time.perf_counter()
-        meta = generator.generate(
-            prompt=MODELS[args.model]["prompt"],
-            width=w,
-            height=h,
-            steps=steps,
-            guidance=MODELS[args.model]["guidance"],
-            seed=args.seed,
-            quantization=4,
-            model=args.model,
-            progress_cb=lambda *a, **k: None,
-            phase_cb=phase_cb,
-            fast_vae=True,
-        )
-        wall = time.perf_counter() - t0
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        slug = args.model.replace("-", "_")
-        img_name = f"{slug}_{w}x{h}_e2e_q4_s{args.seed}_{stamp}.png"
-        img_path = TEST_DIR / img_name
-        gen_dir = BACKEND_DIR / "data" / "generated"
-        src = gen_dir / meta["file"]
-        if src.exists():
-            import shutil
+            t0 = time.perf_counter()
+            meta = generator.generate(
+                prompt=MODELS[args.model]["prompt"],
+                width=w,
+                height=h,
+                steps=steps,
+                guidance=MODELS[args.model]["guidance"],
+                seed=args.seed,
+                quantization=4,
+                model=args.model,
+                progress_cb=lambda *a, **k: None,
+                phase_cb=phase_cb,
+                fast_vae=True,
+            )
+            wall = time.perf_counter() - t0
+            memory_after = _memory_snapshot()
+            phases = _phase_timings(phase_events, t0, t0 + wall)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            slug = args.model.replace("-", "_")
+            img_name = f"{slug}_{w}x{h}_e2e_q4_s{args.seed}_{stamp}.png"
+            img_path = TEST_DIR / img_name
+            gen_dir = BACKEND_DIR / "data" / "generated"
+            src = gen_dir / meta["file"]
+            if src.exists():
+                import shutil
 
-            shutil.copy2(src, img_path)
-        data_artifacts = {
-            "png": f"{meta['id']}.{meta.get('format', 'png')}",
-            "json": f"{meta['id']}.json",
-            "thumb": f"{meta['id']}_thumb.png",
-        }
-        present = {
-            k: (gen_dir / v).exists()
-            for k, v in data_artifacts.items()
-        }
-        print(f"\n== E2E generator.generate() wall {wall:6.2f}s | generation_time={meta['generation_time']}s ==", flush=True)
-        print(f"   data/generated: {data_artifacts} -> {present}", flush=True)
-        phases = {k: round(phase_times.get(k, 0.0), 3) for k in phase_times}
-        _record({
-            "image": img_name,
-            "model": args.model,
-            "variant": "e2e-q4-app-path",
-            "width": w,
-            "height": h,
-            "steps": steps,
-            "seed": args.seed,
-            "guidance": MODELS[args.model]["guidance"],
-            "sampler": meta.get("sampler"),
-            "quantization_bits": 4,
-            "fast_vae": True,
-            "wired_limit_gb": generator._wired_limit_bytes() // (1 << 30),
-            "prompt": MODELS[args.model]["prompt"],
-            "system_load": _sysload(),
-            "wall_clock": round(wall, 3),
-            "generation_time": meta.get("generation_time"),
-            "phases_cb": phases,
-            "data_generated": {"artifacts": data_artifacts, "present": present},
-            "created_at_utc": stamp,
-            "pipeline": "generator.generate() full app path incl. save",
-        })
+                shutil.copy2(src, img_path)
+            data_artifacts = {
+                "png": f"{meta['id']}.{meta.get('format', 'png')}",
+                "json": f"{meta['id']}.json",
+                "thumb": f"{meta['id']}_thumb.png",
+            }
+            present = {
+                k: (gen_dir / v).exists()
+                for k, v in data_artifacts.items()
+            }
+            print(f"\n== E2E generator.generate() wall {wall:6.2f}s | generation_time={meta['generation_time']}s ==", flush=True)
+            print(f"   data/generated: {data_artifacts} -> {present}", flush=True)
+            _record({
+                "image": img_name,
+                "model": args.model,
+                "variant": "e2e-q4-app-path",
+                "width": w,
+                "height": h,
+                "steps": steps,
+                "seed": args.seed,
+                "guidance": MODELS[args.model]["guidance"],
+                "sampler": meta.get("sampler"),
+                "quantization_bits": 4,
+                "transformer_format": "q4",
+                "fast_vae": True,
+                "wired_limit_gb": generator._wired_limit_bytes() / (1 << 30),
+                "rope_memo": "off" if args.no_cache else "on",
+                "text_encoder_cache": "off" if args.no_cache else "on",
+                "pipeline_cache": "cold",
+                "prompt_cache": "cold",
+                "dependencies": _dependency_versions(),
+                "memory": {"scope": "profile-process", "before": memory_before, "after": memory_after},
+                "prompt": MODELS[args.model]["prompt"],
+                "system_load": _sysload(),
+                "wall_clock": round(wall, 3),
+                "generation_time": meta.get("generation_time"),
+                "wall_clock_scope": "cold generator.generate path including model load and save",
+                "phase_sequence": [phase for phase, _ in phase_events],
+                "phases_cb": phases,
+                "data_generated": {"artifacts": data_artifacts, "present": present},
+                "created_at_utc": stamp,
+                "pipeline": "generator.generate() full app path incl. save",
+            })
+    finally:
+        if prev is not None:
+            set_limit = getattr(mx, "set_wired_limit", None) or mx.metal.set_wired_limit
+            set_limit(prev)
     print("\n[done]", flush=True)
 
 

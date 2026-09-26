@@ -1,5 +1,5 @@
 import { useState, memo } from "react";
-import { api, fetchImageBlob, imageUrl } from "../api";
+import { api, downloadImage, fetchImageBlob, imageUrl } from "../api";
 import { bindFullImageDrag } from "../utils/dragDrop";
 
 function CanvasProgressOverlay({ busy, progress, standalone = false, generatingPrompt = null, phase = null, phaseDetail = null }) {
@@ -70,11 +70,16 @@ function ResultCanvas({
   phaseDetail = null,
   batchImages = [],
   generatingPrompt = null,
-  onSetReferenceImage,
-  onVariation,
-}) {
-  const [upscaling, setUpscaling] = useState(null); // null | "lanczos-2" | "lanczos-4"
-  const [copiedField, setCopiedField] = useState(null); // null | "image" | "prompt" | "seed"
+   onSetReferenceImage,
+   onVariation,
+   canSetReference = false,
+   maxReferenceImages = 1,
+ }) {
+   const [upscaling, setUpscaling] = useState(null); // null | "lanczos-2" | "lanczos-4"
+   const [copiedField, setCopiedField] = useState(null); // null | "image" | "prompt" | "seed"
+    const [downloading, setDownloading] = useState(false);
+    const [actionError, setActionError] = useState(null);
+
 
   async function handleUpscale(scale = 2) {
     if (!currentImage?.id) return;
@@ -87,6 +92,7 @@ function ResultCanvas({
       });
       onSetCurrentImage?.(upscaled);
     } catch (e) {
+      setActionError(e?.message || "Upscale failed.");
       console.error("Upscale failed:", e);
     } finally {
       setUpscaling(null);
@@ -116,16 +122,32 @@ function ResultCanvas({
     } catch {}
   }
 
-  async function copySeed() {
-    if (currentImage?.seed == null) return;
-    try {
-      await navigator.clipboard.writeText(String(currentImage.seed));
-      setCopiedField("seed");
-      setTimeout(() => setCopiedField(null), 1500);
-    } catch {}
-  }
+   async function copySeed() {
+     if (currentImage?.seed == null) return;
+     try {
+       await navigator.clipboard.writeText(String(currentImage.seed));
+       setCopiedField("seed");
+       setTimeout(() => setCopiedField(null), 1500);
+     } catch {}
+   }
 
-  return (
+   async function handleDownload() {
+     if (!currentImage?.id || downloading) return;
+     setDownloading(true);
+     try {
+       const filename = currentImage.file
+         || `${currentImage.id}.${currentImage.format || "png"}`;
+       await downloadImage(currentImage.id, filename);
+      } catch (err) {
+        setActionError(err?.message || "Download failed.");
+        console.error("Download failed:", err);
+      } finally {
+       setDownloading(false);
+     }
+   }
+
+   return (
+
     <div className="result-canvas-panel">
       <div className="canvas-header">
         <h3>Studio Canvas</h3>
@@ -280,65 +302,80 @@ function ResultCanvas({
             )}
           </div>
 
-          <div className="canvas-actions">
-            <button
-              className="action-btn"
-              onClick={() => handleUpscale(2)}
-              disabled={upscaling != null || busy}
-              title="Fast Resampling 2x (Lanczos + Unsharp)"
-            >
+           {actionError && <p className="error" role="alert">{actionError}</p>}
+           <div className="canvas-actions">
+             <button
+               type="button"
+               className="action-btn"
+               onClick={() => handleUpscale(2)}
+               disabled={upscaling != null || busy}
+               title="Fast Resampling 2x (Lanczos + Unsharp)"
+             >
+
               {upscaling === "lanczos-2" ? "Fast 2x…" : "⚡ Fast 2x"}
             </button>
-            <button
-              className="action-btn"
-              onClick={() => handleUpscale(4)}
-              disabled={upscaling != null || busy}
-              title="Fast Resampling 4x (Lanczos + Unsharp)"
-            >
+             <button
+               type="button"
+               className="action-btn"
+               onClick={() => handleUpscale(4)}
+               disabled={upscaling != null || busy}
+               title="Fast Resampling 4x (Lanczos + Unsharp)"
+             >
+
               {upscaling === "lanczos-4" ? "Fast 4x…" : "⚡ Fast 4x"}
             </button>
-            <button
-              className="action-btn"
-              onClick={() => {
-                const filename = currentImage.file || (currentImage.format ? `${currentImage.id}.${currentImage.format.toLowerCase()}` : `${currentImage.id}.png`);
-                onSetReferenceImage?.({
-                  path: filename,
-                  preview: imageUrl(currentImage.id),
-                });
-              }}
-              title="Use this image as Img2Img reference"
-            >
-              🖼️ Use as Reference
-            </button>
-            <button
-              className="action-btn"
-              onClick={() => onVariation?.(currentImage)}
-              disabled={busy}
-              title="Generate a variation with Seed + 1"
-            >
+             {canSetReference && (
+               <button
+                 type="button"
+                 className="action-btn"
+                 onClick={() => {
+                   const filename = currentImage.file || (currentImage.format ? `${currentImage.id}.${currentImage.format.toLowerCase()}` : `${currentImage.id}.png`);
+                   onSetReferenceImage?.({
+                     path: filename,
+                     preview: imageUrl(currentImage.id),
+                   });
+                 }}
+                 title={`Use this image as a reference (up to ${maxReferenceImages})`}
+               >
+                 🖼️ Use as Reference
+               </button>
+             )}
+
+             <button
+               type="button"
+               className="action-btn"
+               onClick={() => onVariation?.(currentImage)}
+               disabled={busy}
+               title="Generate a variation with Seed + 1"
+             >
+
               🔄 Variation
             </button>
-            <button
-              className="action-btn"
-              onClick={copyImageToClipboard}
-              title="Copy PNG pixels to system clipboard"
-            >
+             <button
+               type="button"
+               className="action-btn"
+               onClick={copyImageToClipboard}
+               title="Copy PNG pixels to system clipboard"
+             >
+
               {copiedField === "image" ? "Image Copied ✓" : "📋 Copy Image"}
             </button>
-            <button className="action-btn" onClick={copyPrompt} title="Copy Prompt">
-              {copiedField === "prompt" ? "Prompt Copied ✓" : "📋 Copy Prompt"}
-            </button>
-            <button className="action-btn" onClick={copySeed} title="Copy Seed">
-              {copiedField === "seed" ? "Seed Copied ✓" : "📋 Copy Seed"}
-            </button>
-            <a
-              className="action-btn download-link"
-              href={imageUrl(currentImage.id)}
-              download={currentImage.file || `${currentImage.id}.${currentImage.format || 'png'}`}
-              title={`Download full resolution ${currentImage.file?.endsWith('.jpeg') || currentImage.file?.endsWith('.jpg') || currentImage.format === 'jpeg' ? 'JPEG' : 'PNG'}`}
-            >
-              ⬇ Download
-            </a>
+             <button type="button" className="action-btn" onClick={copyPrompt} title="Copy Prompt">
+               {copiedField === "prompt" ? "Prompt Copied ✓" : "📋 Copy Prompt"}
+             </button>
+             <button type="button" className="action-btn" onClick={copySeed} title="Copy Seed">
+               {copiedField === "seed" ? "Seed Copied ✓" : "📋 Copy Seed"}
+             </button>
+             <button
+               type="button"
+               className="action-btn"
+               onClick={handleDownload}
+               disabled={downloading}
+               title="Download the full-resolution image"
+             >
+               {downloading ? "Downloading…" : "⬇ Download"}
+             </button>
+
 
           </div>
         </div>

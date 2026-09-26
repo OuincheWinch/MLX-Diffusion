@@ -8,15 +8,16 @@ export default function ModelsSection({ models, loading, onModelsChanged, onFeed
   const [err, setErr] = useState(null);
 
   async function removeModel(m) {
-    if (!window.confirm(`Remove the weights of "${m.label}" from disk?\n\nYou can re-download it later from the Generate tab.`)) {
+    const action = m.local_path || m.local_path_configured ? "unlink the configured local path (files stay on disk)" : "remove the managed weights from disk";
+    if (!window.confirm(`${action} for "${m.label}"?\n\nYou can re-download it later from the Generate tab.`)) {
       return;
     }
     setRemoving(m.id);
     setErr(null);
     try {
-      await api(`/api/models/${m.id}`, { method: "DELETE" });
+      const result = await api(`/api/models/${m.id}`, { method: "DELETE" });
       await onModelsChanged?.();
-      onFeedback?.({ type: "success", text: `${m.label} removed from disk` });
+      onFeedback?.({ type: "success", text: result?.status === "unlinked" ? `${m.label} local path unlinked` : `${m.label} removed from disk` });
     } catch (e) {
       setErr(e.message || String(e));
     } finally {
@@ -55,19 +56,19 @@ export default function ModelsSection({ models, loading, onModelsChanged, onFeed
               </span>
               <span className="models-size">{formatBytes(m.disk_usage_bytes || 0)}</span>
               <span className="models-actions">
-                {installed ? (
-                  <button
-                    type="button"
-                    className="btn-mini"
-                    disabled={removing === m.id}
-                    onClick={() => removeModel(m)}
-                    title="Delete weights from disk (guard: refuses while generating/downloading)"
-                  >
-                    {removing === m.id ? "Deleting…" : "🗑 Remove"}
-                  </button>
-                ) : (
-                  <ModelInstaller modelInfo={m} onInstalled={onModelsChanged} />
-                )}
+                 {installed || m.local_path_configured ? (
+                   <button
+                     type="button"
+                     className="btn-mini"
+                     disabled={removing === m.id}
+                     onClick={() => removeModel(m)}
+                     title="Delete weights from disk (guard: refuses while generating/downloading)"
+                   >
+                     {removing === m.id ? "Deleting…" : m.local_path_configured ? "🔗 Unlink path" : "🗑 Remove"}
+                   </button>
+                 ) : (
+                   <ModelInstaller modelInfo={m} onInstalled={onModelsChanged} />
+                 )}
               </span>
             </div>
           );

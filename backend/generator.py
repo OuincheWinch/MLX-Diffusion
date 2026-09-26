@@ -1,8 +1,13 @@
+import atexit
 import collections
 import gc
 import json
+import math
 import os
+import queue
+import re
 import select
+import signal
 import subprocess
 import sys
 import threading
@@ -15,6 +20,7 @@ from PIL import Image, ExifTags
 from PIL.PngImagePlugin import PngInfo
 
 from image_meta import (
+    atomic_write_json,
     save_image_with_metadata,
     extract_image_metadata,
 )
@@ -64,10 +70,36 @@ try:
 except Exception:
     pass
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = app_settings.DATA_DIR
+ASSET_DIR = app_settings.ASSET_DIR
 ROOT = Path(__file__).resolve().parent.parent
 GENERATED_DIR = DATA_DIR / "generated"
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_orphan_artifacts(max_age_seconds: float = 3600.0) -> int:
+    cutoff = time.time() - max(0.0, float(max_age_seconds))
+    removed = 0
+    try:
+        candidates = list(GENERATED_DIR.glob("*.raw.png"))
+        candidates.extend(
+            path for path in GENERATED_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in (".png", ".jpg", ".jpeg")
+            and re.fullmatch(r"[a-f0-9]{32}", path.stem)
+            and not (GENERATED_DIR / f"{path.stem}.json").exists()
+        )
+        for path in candidates:
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return removed
+
 
 DEFAULT_MODEL = "mlx-community/flux2-klein-4b-4bit"
 DEFAULT_MODEL_ID = "flux2-klein-4b"
@@ -79,6 +111,7 @@ _QWEN_SCHEDULERS = {
     "linear": "linear",
     "euler": "flow_match_euler_discrete",
 }
+_MAX_PROMPT_BYTES = 128 * (1 << 10)
 
 MODELS = {
     "flux2-klein-4b": {
@@ -97,6 +130,7 @@ MODELS = {
         "supports_negative": False,
         "supports_loras": True,
         "supports_multi_reference": True,
+        "supports_ref": True,
         "max_reference_images": 10,
         "supports_fast_vae": True,
         "lora_format": "FLUX.2",
@@ -121,6 +155,7 @@ MODELS = {
         "supports_negative": False,
         "supports_loras": True,
         "supports_multi_reference": True,
+        "supports_ref": True,
         "max_reference_images": 10,
         "supports_fast_vae": True,
         "lora_format": "FLUX.2",
@@ -134,7 +169,7 @@ MODELS = {
         "id": "juggernaut-xl-lightning",
         "label": "Juggernaut XL Lightning (MLX)",
         "repo": "RunDiffusion/Juggernaut-XL-Lightning",
-        "model_dir": DATA_DIR / "models" / "juggernaut-xl-lightning",
+        "model_dir": ASSET_DIR / "models" / "juggernaut-xl-lightning",
         "engine": "sdxl",
         "civitai_version_id": 357609,
         "civitai_model_id": 133005,
@@ -147,6 +182,8 @@ MODELS = {
         "supports_guidance": True,
         "supports_negative": True,
         "supports_loras": True,
+        "supports_ref": False,
+        "max_reference_images": 0,
         "supports_fast_vae": True,
         "samplers": ["euler_trailing", "dpmpp_2m_karras", "euler_a_substep", "euler_a", "euler", "ddim"],
         "lora_format": "SDXL",
@@ -163,7 +200,7 @@ MODELS = {
         "id": "realvis-xl-v5-lightning",
         "label": "RealVisXL V5.0 Lightning (MLX)",
         "repo": "SG161222/RealVisXL_V5.0_Lightning",
-        "model_dir": DATA_DIR / "models" / "realvis-xl-v5-lightning",
+        "model_dir": ASSET_DIR / "models" / "realvis-xl-v5-lightning",
         "engine": "sdxl",
         "civitai_version_id": 361593,
         "civitai_model_id": 139562,
@@ -176,6 +213,8 @@ MODELS = {
         "supports_guidance": True,
         "supports_negative": True,
         "supports_loras": True,
+        "supports_ref": False,
+        "max_reference_images": 0,
         "supports_fast_vae": True,
         "samplers": ["euler_trailing", "dpmpp_2m_karras", "euler_a_substep", "euler_a", "euler", "ddim"],
         "lora_format": "SDXL",
@@ -190,7 +229,7 @@ MODELS = {
         "id": "realvis-xl-v5",
         "label": "RealVisXL V5.0 Standard / Hyper-SD",
         "repo": "SG161222/RealVisXL_V5.0",
-        "model_dir": DATA_DIR / "models" / "realvis-xl-v5",
+        "model_dir": ASSET_DIR / "models" / "realvis-xl-v5",
         "engine": "sdxl",
         "civitai_version_id": 361592,
         "civitai_model_id": 139562,
@@ -203,6 +242,8 @@ MODELS = {
         "supports_guidance": True,
         "supports_negative": True,
         "supports_loras": True,
+        "supports_ref": False,
+        "max_reference_images": 0,
         "supports_fast_vae": True,
         "samplers": ["dpmpp_2m_karras", "euler_a", "euler", "euler_trailing", "ddim"],
         "lora_format": "SDXL",
@@ -217,7 +258,7 @@ MODELS = {
         "id": "juggernaut-xi",
         "label": "Juggernaut XI v11 (MLX)",
         "repo": "RunDiffusion/Juggernaut-XI-v11",
-        "model_dir": DATA_DIR / "models" / "juggernaut-xi",
+        "model_dir": ASSET_DIR / "models" / "juggernaut-xi",
         "engine": "sdxl",
         "civitai_version_id": 782002,
         "civitai_model_id": 133005,
@@ -230,6 +271,8 @@ MODELS = {
         "supports_guidance": True,
         "supports_negative": True,
         "supports_loras": True,
+        "supports_ref": False,
+        "max_reference_images": 0,
         "supports_fast_vae": True,
         "samplers": ["euler_trailing", "dpmpp_2m_karras", "euler_a_substep", "euler_a", "euler", "ddim"],
         "lora_format": "SDXL",
@@ -255,6 +298,8 @@ MODELS = {
         "supports_guidance": False,
         "supports_negative": False,
         "supports_loras": True,
+        "supports_ref": True,
+        "max_reference_images": 1,
         "supports_fast_vae": True,
         "lora_format": "Z-Image",
         "presets": [
@@ -279,6 +324,7 @@ MODELS = {
         "supports_negative": False,
         "supports_loras": True,
         "supports_ref": True,
+        "max_reference_images": 1,
         "supports_fast_vae": True,
         "lora_format": "Krea 2",
         # Size caps removed 2026-09-22 (user decision). 16GB M1 note: the 3D
@@ -303,7 +349,8 @@ MODELS = {
         "supports_guidance": True,
         "supports_negative": True,
         "supports_loras": False,
-        "supports_ref": True,  # single-image img2img (denoise strength)
+        "supports_ref": True,
+        "max_reference_images": 1,
         "supports_fast_vae": False,
         # 2026-09-23: default sampler flipped to "linear". The forced
         # flow_match_euler_discrete (empirical-mu) sampler catastrophically
@@ -324,15 +371,15 @@ MODELS = {
 }
 
 
-def get_model_info(model_id: str) -> dict:
+def get_model_info(model_id: str) -> dict | None:
     if not model_id:
-        return MODELS[DEFAULT_MODEL_ID]
+        return None
     if model_id in MODELS:
         return MODELS[model_id]
     for m in MODELS.values():
         if m.get("repo") == model_id or m.get("id") == model_id:
             return m
-    return MODELS[DEFAULT_MODEL_ID]
+    return None
 
 # Wired memory hint (bytes) used during generation to keep Metal from
 # swapping on 16GB machines. Set MLX_WIRED_LIMIT_GB=0 to disable.
@@ -432,6 +479,7 @@ def _krea_wired_limit_bytes() -> int:
     return min(int(limit * (1 << 30)), 9 * (1 << 30))
 
 _lock = threading.Lock()
+_model_maintenance_lock = threading.RLock()
 _cancel_event = threading.Event()
 _pipeline = None
 _current_pipeline_key = None
@@ -439,8 +487,288 @@ _current_pipeline_model = None
 _current_sdxl_model = None
 _prompt_cache: OrderedDict[str, tuple] = OrderedDict()
 _PROMPT_CACHE_MAX_SIZE = 32
+_PROMPT_CACHE_MAX_BYTES = 256 * (1 << 20)
 
 _taef_models: dict = {}
+
+
+def _value_bytes(value) -> int:
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+    if isinstance(value, dict):
+        return sum(_value_bytes(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_value_bytes(v) for v in value)
+    return 0
+
+
+def _trim_prompt_cache():
+    total = sum(_value_bytes(v) for v in _prompt_cache.values())
+    while _prompt_cache and (
+        len(_prompt_cache) > _PROMPT_CACHE_MAX_SIZE or total > _PROMPT_CACHE_MAX_BYTES
+    ):
+        _, value = _prompt_cache.popitem(last=False)
+        total -= _value_bytes(value)
+
+
+def _cache_prompt(key, value):
+    _prompt_cache[key] = value
+    _prompt_cache.move_to_end(key)
+    _trim_prompt_cache()
+
+
+_PROCESS_READER_CHUNK = 65536
+_PROCESS_READER_MAX_LINE = 4 * (1 << 20)
+_ENGINE_TIMEOUT_DEFAULT_S = 1800.0
+_qwen_process = None
+_qwen_reader_messages = None
+_qwen_reader_done = None
+_qwen_reader_thread = None
+_qwen_stderr_thread = None
+_qwen_stderr_done = None
+
+
+def _engine_timeout(name: str) -> float:
+    try:
+        value = float(os.environ.get(name, _ENGINE_TIMEOUT_DEFAULT_S))
+    except (TypeError, ValueError):
+        return _ENGINE_TIMEOUT_DEFAULT_S
+    return max(1.0, value)
+
+
+def _write_process_request(proc, payload: bytes, cancel_events, timeout_s: float):
+    if proc is None or proc.stdin is None:
+        raise RuntimeError("engine stdin is unavailable")
+    try:
+        fd = proc.stdin.fileno()
+        os.set_blocking(fd, False)
+    except (AttributeError, OSError, ValueError) as e:
+        raise RuntimeError("engine stdin is unavailable") from e
+    deadline = time.monotonic() + timeout_s
+    offset = 0
+    while offset < len(payload):
+        if any(event is not None and event.is_set() for event in cancel_events):
+            _terminate_process(proc)
+            raise GenerationCancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process(proc, force=True)
+            raise TimeoutError("engine request write timed out")
+        try:
+            _, writable, _ = select.select([], [fd], [], min(0.1, remaining))
+        except (OSError, ValueError) as e:
+            raise RuntimeError("engine stdin is unavailable") from e
+        if not writable:
+            continue
+        try:
+            written = os.write(fd, payload[offset:])
+        except BlockingIOError:
+            continue
+        except (BrokenPipeError, OSError) as e:
+            raise RuntimeError("engine closed its input") from e
+        if written <= 0:
+            raise RuntimeError("engine accepted no request bytes")
+        offset += written
+
+
+def _read_process_stream(stream, callback):
+    fd = None
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        fd = None
+    pending = bytearray()
+    if fd is not None:
+        while True:
+            chunk = os.read(fd, _PROCESS_READER_CHUNK)
+            if not chunk:
+                break
+            pending.extend(chunk)
+            while True:
+                index = pending.find(b"\n")
+                if index < 0:
+                    break
+                line = bytes(pending[:index])
+                del pending[: index + 1]
+                callback(line.decode("utf-8", errors="replace"))
+            if len(pending) > _PROCESS_READER_MAX_LINE:
+                raise ValueError("subprocess output line exceeded size limit")
+    else:
+        while True:
+            chunk = stream.read(_PROCESS_READER_CHUNK)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", errors="replace")
+            pending.extend(chunk)
+            while True:
+                index = pending.find(b"\n")
+                if index < 0:
+                    break
+                line = bytes(pending[:index])
+                del pending[: index + 1]
+                callback(line.decode("utf-8", errors="replace"))
+            if len(pending) > _PROCESS_READER_MAX_LINE:
+                raise ValueError("subprocess output line exceeded size limit")
+    if pending:
+        callback(bytes(pending).decode("utf-8", errors="replace"))
+
+
+def _start_json_reader(proc):
+    messages = queue.Queue()
+    done = threading.Event()
+
+    def _run():
+        try:
+            _read_process_stream(proc.stdout, messages.put)
+        except Exception as exc:
+            messages.put(exc)
+        finally:
+            messages.put(None)
+            done.set()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return messages, done, thread
+
+
+def _start_stderr_reader(proc, tail):
+    done = threading.Event()
+
+    def _run():
+        try:
+            _read_process_stream(proc.stderr, lambda line: tail.append(f"{line}\n"))
+        except Exception as exc:
+            tail.append(f"[reader] {exc}\n")
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return done, thread
+
+
+def _drain_stderr(proc):
+    _read_process_stream(proc.stderr, lambda line: _sdxl_stderr_tail.append(line))
+
+
+def _close_process_streams(proc):
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, stream_name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _terminate_process(proc, force=False):
+    if proc is None:
+        return
+    try:
+        alive = proc.poll() is None
+    except Exception:
+        alive = True
+    if alive:
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        delivered = False
+        if os.name == "posix" and getattr(proc, "_mlx_process_group", False):
+            try:
+                os.killpg(proc.pid, sig)
+                delivered = True
+            except (OSError, ProcessLookupError):
+                pass
+        if not delivered:
+            try:
+                if force:
+                    proc.kill()
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "posix" and getattr(proc, "_mlx_process_group", False):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5.0)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                proc.wait()
+            except Exception:
+                pass
+    else:
+        try:
+            proc.wait(timeout=0.1)
+        except Exception:
+            pass
+    _close_process_streams(proc)
+
+
+def _join_reader(thread, timeout=1.0):
+    if thread is not None:
+        thread.join(timeout=timeout)
+
+
+def _read_engine_message(proc, messages, done, cancel_events, timeout_s, label, tail=None):
+    if proc is None or messages is None or done is None:
+        raise RuntimeError(f"{label} reader is not initialized")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if any(event is not None and event.is_set() for event in cancel_events):
+            _terminate_process(proc)
+            raise GenerationCancelled()
+        try:
+            message = messages.get(timeout=0.1)
+        except queue.Empty:
+            if done.is_set() and messages.empty():
+                return None
+            if proc.poll() is not None and done.is_set():
+                return None
+            if time.monotonic() >= deadline:
+                _terminate_process(proc, force=True)
+                detail = "".join(tail)[-2000:] if tail is not None else ""
+                suffix = f": {detail}" if detail else ""
+                raise TimeoutError(f"{label} timed out after {timeout_s:.0f}s{suffix}")
+            continue
+        if message is None:
+            return None
+        if isinstance(message, BaseException):
+            raise RuntimeError(f"{label} reader failed: {message}") from message
+        return message
+
+
+def _kill_qwen_process():
+    global _qwen_process, _qwen_reader_messages, _qwen_reader_done, _qwen_reader_thread, _qwen_stderr_thread, _qwen_stderr_done
+    proc = _qwen_process
+    if proc is not None:
+        _terminate_process(proc)
+    _join_reader(_qwen_stderr_thread)
+    _join_reader(_qwen_reader_thread)
+    if _qwen_process is proc:
+        _qwen_process = None
+    _qwen_reader_messages = None
+    _qwen_reader_done = None
+    _qwen_reader_thread = None
+    _qwen_stderr_thread = None
+    _qwen_stderr_done = None
+    if proc is not None:
+        gc.collect()
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:
+            pass
 
 
 def _get_taef_decoder(variant: str):
@@ -466,8 +794,13 @@ class GenerationCancelled(Exception):
 
 
 def cancel_current():
-    """Ask the running generation to abort at the next denoising step."""
     _cancel_event.set()
+    for proc in (_qwen_process, globals().get("_sdxl_daemon")):
+        try:
+            if proc is not None and proc.poll() is None:
+                _terminate_process(proc)
+        except Exception:
+            pass
 
 
 def model_download_repo(model_id: str, minfo: dict) -> str | None:
@@ -487,27 +820,65 @@ def model_download_repo(model_id: str, minfo: dict) -> str | None:
     return minfo.get("repo")
 
 
+def _model_path_has_incomplete(path: Path) -> bool:
+    try:
+        return any(
+            candidate.name.endswith((".incomplete", ".part"))
+            for candidate in path.rglob("*")
+            if candidate.is_file() and ".cache" not in candidate.relative_to(path).parts
+        )
+    except (OSError, ValueError):
+        return True
+
+
+def _model_path_has_weights(path: Path) -> bool:
+    try:
+        indexes = list(path.rglob("*.safetensors.index.json"))
+        if indexes:
+            for index_path in indexes:
+                data = json.loads(index_path.read_text("utf-8"))
+                weight_map = data.get("weight_map") if isinstance(data, dict) else None
+                if not isinstance(weight_map, dict) or not weight_map:
+                    return False
+                if any(not (index_path.parent / str(filename)).is_file() for filename in weight_map.values()):
+                    return False
+            return True
+        return any(path.rglob("*.safetensors"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+
+
 def is_model_cached(model_id: str) -> bool:
     minfo = get_model_info(model_id)
     if not minfo:
-        return True
-    if resolve_local_model_path(model_id) is not None:
-        return True
+        return False
+    local = resolve_local_model_path(model_id)
+    if local is not None:
+        if minfo.get("engine") == "sdxl":
+            return (local / "model_index.json").is_file() and not _model_path_has_incomplete(local) and _model_path_has_weights(local)
+        return not _model_path_has_incomplete(local) and _model_path_has_weights(local)
     if minfo.get("engine") == "sdxl":
         model_dir = minfo.get("model_dir")
-        return bool(model_dir and Path(model_dir).exists())
+        if not model_dir:
+            return False
+        path = Path(model_dir)
+        return (path / "model_index.json").is_file() and not _model_path_has_incomplete(path) and _model_path_has_weights(path)
     if model_id == "krea2-turbo":
-        return (DATA_DIR / "models" / "krea2-turbo-q4").exists()
+        path = ASSET_DIR / "models" / "krea2-turbo-q4"
+        return path.is_dir() and not _model_path_has_incomplete(path) and _model_path_has_weights(path)
     repo = model_download_repo(model_id, minfo) or ""
-    if "/" in repo:
-        hf_dir_name = f"models--{repo.replace('/', '--')}"
-        hf_cache = Path.home() / ".cache" / "huggingface" / "hub" / hf_dir_name
-        snapshots = hf_cache / "snapshots"
-        try:
-            if snapshots.exists() and any(snapshots.iterdir()):
+    if "/" not in repo:
+        return False
+    cache_dir = _hf_repo_cache_dir(repo)
+    snapshots = cache_dir / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    try:
+        for snapshot in snapshots.iterdir():
+            if snapshot.is_dir() and not _model_path_has_incomplete(snapshot) and _model_path_has_weights(snapshot) and any(snapshot.rglob("*.json")):
                 return True
-        except Exception:
-            pass
+    except OSError:
+        return False
     return False
 
 
@@ -576,6 +947,8 @@ def validate_local_model_dir(model_id: str, path: Path | str) -> tuple[bool, str
         return False, "path is not a directory"
     resolved = _resolve_hf_cache_snapshot(p)
     minfo = get_model_info(model_id)
+    if not minfo:
+        return False, "unknown model"
     if minfo.get("engine") == "sdxl":
         if (resolved / "model_index.json").exists() or any(resolved.rglob("*.safetensors")):
             return True, None
@@ -634,15 +1007,21 @@ def is_pipeline_loaded(model_id: str, quantization: int = 4, loras: list | None 
         model_dir = str(
             resolve_local_model_path(model_id)
             or minfo.get("model_dir")
-            or (DATA_DIR / "models" / "juggernaut-xl-lightning")
+            or (ASSET_DIR / "models" / "juggernaut-xl-lightning")
         )
         return (
-            _sdxl_daemon is not None
+            _qwen_process is None
+            and _sdxl_daemon is not None
             and _sdxl_daemon.poll() is None
             and _current_sdxl_model == model_dir
         )
     key = _make_pipeline_key(model_id, quantization, loras or [], variant)
-    return _pipeline is not None and _current_pipeline_key == key
+    return (
+        _qwen_process is None
+        and _sdxl_daemon is None
+        and _pipeline is not None
+        and _current_pipeline_key == key
+    )
 
 
 def _dir_size(path) -> int:
@@ -681,7 +1060,7 @@ def model_disk_usage(model_id: str, minfo: dict | None = None) -> int:
                 return 0
             return _dir_size(d)
         if model_id == "krea2-turbo":
-            return _dir_size(DATA_DIR / "models" / "krea2-turbo-q4")
+            return _dir_size(ASSET_DIR / "models" / "krea2-turbo-q4")
         repo = model_download_repo(model_id, minfo) or ""
         if "/" in repo:
             return _dir_size(_hf_repo_cache_dir(repo))
@@ -689,9 +1068,16 @@ def model_disk_usage(model_id: str, minfo: dict | None = None) -> int:
 
 
 def uninstall_model(model_id: str) -> tuple[bool, str | None]:
+    with _model_maintenance_lock:
+        return _uninstall_model(model_id)
+
+
+def _uninstall_model(model_id: str) -> tuple[bool, str | None]:
     """Remove a model's weights from disk. Refuses (False, reason) while the model
     is queued/generating or a weights download is in-flight for it."""
     minfo = get_model_info(model_id)
+    if not minfo:
+        return False, "unknown model"
     try:
         import state
 
@@ -703,7 +1089,7 @@ def uninstall_model(model_id: str) -> tuple[bool, str | None]:
                 if req is None:
                     continue
                 rid = getattr(req, "model", "") if not isinstance(req, dict) else req.get("model", "")
-                if rid == model_id or rid == minfo.get("repo") or get_model_info(rid).get("id") == model_id:
+                if rid == model_id or rid == minfo.get("repo") or (get_model_info(rid) or {}).get("id") == model_id:
                     return False, f"{model_id} has an active generation job"
         with state._MODEL_DOWNLOAD_LOCK:
             for t in state.MODEL_DOWNLOAD_TASKS.values():
@@ -712,7 +1098,11 @@ def uninstall_model(model_id: str) -> tuple[bool, str | None]:
     except Exception as e:
         print(f"[generator] uninstall guard error: {e}", flush=True)
 
+    configured_local = app_settings.configured_model_local_path(model_id)
     local_raw = app_settings.model_local_path(model_id)
+    if configured_local and not local_raw:
+        app_settings.update_settings({"model_paths": {model_id: ""}})
+        return True, "local path unlinked; files left on disk"
     unlinked = False
     try:
         removed_any = False
@@ -724,6 +1114,8 @@ def uninstall_model(model_id: str) -> tuple[bool, str | None]:
         elif minfo.get("engine") == "sdxl":
             d = minfo.get("model_dir")
             if d and Path(d).exists():
+                if ASSET_DIR != DATA_DIR and Path(d).resolve().is_relative_to(ASSET_DIR.resolve()):
+                    return False, "model is in the shared asset store; remove it from the source application"
                 import shutil
 
                 shutil.rmtree(Path(d), ignore_errors=True)
@@ -733,8 +1125,10 @@ def uninstall_model(model_id: str) -> tuple[bool, str | None]:
         elif model_id == "krea2-turbo":
             import shutil
 
-            d = DATA_DIR / "models" / "krea2-turbo-q4"
+            d = ASSET_DIR / "models" / "krea2-turbo-q4"
             if d.exists():
+                if ASSET_DIR != DATA_DIR:
+                    return False, "model is in the shared asset store; remove it from the source application"
                 shutil.rmtree(d, ignore_errors=True)
                 removed_any = not d.exists()
                 if not removed_any:
@@ -843,7 +1237,7 @@ def get_engine_status() -> dict:
     now = time.time()
     mflux_idle = _mflux_idle_kill_s()
     status["mflux"] = {
-        "resident": _pipeline is not None,
+        "resident": _pipeline is not None and _sdxl_daemon is None and _qwen_process is None,
         "model": _current_pipeline_model,
         "idle_kill_s": mflux_idle,
         "watchdog_armed": _mflux_watchdog is not None and _mflux_watchdog.is_alive(),
@@ -855,7 +1249,8 @@ def get_engine_status() -> dict:
     }
     sdxl_idle = _sdxl_idle_kill_s()
     status["sdxl"] = {
-        "resident": _sdxl_daemon is not None and _sdxl_daemon.poll() is None,
+        "resident": _pipeline is None and _qwen_process is None and _sdxl_daemon is not None and _sdxl_daemon.poll() is None,
+        "pid": _sdxl_daemon.pid if _sdxl_daemon is not None else None,
         "model": Path(_current_sdxl_model).name if _current_sdxl_model else None,
         "idle_kill_s": sdxl_idle,
         "watchdog_armed": _sdxl_watchdog is not None and _sdxl_watchdog.is_alive(),
@@ -864,6 +1259,10 @@ def get_engine_status() -> dict:
             max(0, sdxl_idle - (now - _sdxl_idle_since)) if _sdxl_idle_since else None
         ),
         "stderr_tail": "".join(_sdxl_stderr_tail)[-1200:],
+    }
+    status["qwen"] = {
+        "resident": _pipeline is None and _sdxl_daemon is None and _qwen_process is not None and _qwen_process.poll() is None,
+        "pid": _qwen_process.pid if _qwen_process is not None else None,
     }
     status["taef"] = sorted(_taef_models.keys())
 
@@ -901,11 +1300,39 @@ class _ProgressCallback:
             self._phase_cb("saving", "Decoding VAE latents & saving image...")
 
 
+def _normalize_lora_path(path: str) -> str:
+    raw = str(path)
+    candidate = Path(raw).expanduser()
+    if candidate.exists() or raw.startswith(("/", "~", "./", "../")):
+        return str(candidate.resolve())
+    return raw
+
+
+def _normalize_loras(loras: list[dict] | None) -> list[dict]:
+    normalized = []
+    for lora in loras or []:
+        if not isinstance(lora, dict) or not lora.get("path"):
+            continue
+        item = dict(lora)
+        item["path"] = _normalize_lora_path(item["path"])
+        normalized.append(item)
+    return normalized
+
+
+def _lora_signature(path: str) -> tuple:
+    normalized = _normalize_lora_path(path)
+    try:
+        stat = Path(normalized).stat()
+        return (normalized, stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return (normalized, None, None)
+
+
 def _make_pipeline_key(model_id: str, quantization: int, loras: list[dict], variant: str = "standard") -> tuple:
     return (
         model_id,
         quantization,
-        tuple(sorted(l["path"] for l in loras)),
+        tuple(sorted(_lora_signature(l["path"]) for l in loras)),
         variant,
     )
 
@@ -948,9 +1375,7 @@ def _apply_prompt_cache(pipe):
                 guidance=1.0,  # encode only the positive prompt here
             )[0:2]
             mx.eval(prompt_embeds, text_ids)
-            _prompt_cache[prompt] = (prompt_embeds, text_ids)
-            if len(_prompt_cache) > _PROMPT_CACHE_MAX_SIZE:
-                _prompt_cache.popitem(last=False)
+            _cache_prompt(prompt, (prompt_embeds, text_ids))
         negative_embeds, negative_ids = None, None
         if guidance is not None and guidance > 1.0 and negative_prompt is not None:
             neg_key = f"\x00neg:{negative_prompt}"
@@ -964,9 +1389,7 @@ def _apply_prompt_cache(pipe):
                     guidance=1.0,
                 )[0:2]
                 mx.eval(negative_embeds, negative_ids)
-                _prompt_cache[neg_key] = (negative_embeds, negative_ids)
-                if len(_prompt_cache) > _PROMPT_CACHE_MAX_SIZE:
-                    _prompt_cache.popitem(last=False)
+                _cache_prompt(neg_key, (negative_embeds, negative_ids))
         return prompt_embeds, text_ids, negative_embeds, negative_ids
 
     pipe._encode_prompt_pair = cached_encode
@@ -996,12 +1419,92 @@ def _apply_prompt_cache_txt(pipe):
         mx.eval(embeds)
         if neg is not None:
             mx.eval(neg)
-        if len(_prompt_cache) >= _PROMPT_CACHE_MAX_SIZE:
-            _prompt_cache.popitem(last=False)
-        _prompt_cache[key] = (embeds, neg)
+        _cache_prompt(key, (embeds, neg))
         return embeds, neg
 
     pipe._encode_prompts = cached_encode
+
+
+def _install_flux_text_encoder_tail_trim(pipe):
+    if os.environ.get("MLX_DISABLE_FLUX_TE_TRIM") == "1":
+        return
+    text_encoder = getattr(pipe, "text_encoder", None)
+    layers = getattr(text_encoder, "layers", None)
+    if text_encoder is None or layers is None or len(layers) != 36:
+        return
+    if getattr(text_encoder, "num_hidden_layers", None) != 36:
+        return
+    text_encoder.layers = layers[:28]
+    text_encoder.num_hidden_layers = 28
+    text_encoder._mlxdiffusion_te_tail_trimmed = True
+
+
+def _install_krea_sampler_scalar_cache():
+    if os.environ.get("MLX_DISABLE_KREA_SIGMA_CACHE") == "1":
+        return
+    try:
+        import mlx.core as mx
+        from mflux.models.krea2.model.krea2_sampler import ErSdeStepper
+
+        if getattr(ErSdeStepper, "_mlxdiffusion_sigma_cache", False):
+            return
+
+        def step(self, i, x, v, denoised):
+            sigmas = self.sigmas
+            zero_flags = getattr(self, "_sigma_zero_flags", None)
+            if zero_flags is None:
+                mx.eval(sigmas)
+                zero_flags = [float(value.item()) == 0.0 for value in sigmas]
+                self._sigma_zero_flags = zero_flags
+            if zero_flags[i + 1]:
+                self._old_denoised = denoised
+                return denoised
+
+            ls, lt = sigmas[i], sigmas[i + 1]
+            r = self._noise_scaler(lt) / self._noise_scaler(ls)
+
+            x = r * x + (1 - r) * denoised
+
+            stage = min(self.max_stage, i + 1)
+            if stage >= 2 and self._old_denoised is not None:
+                dt = lt - ls
+                step_size = -dt / self.NUM_POINTS
+                lam_pos = lt + self._point_indice * step_size
+                scaled = self._noise_scaler(lam_pos)
+
+                s = mx.sum(1.0 / scaled) * step_size
+                denoised_d = (denoised - self._old_denoised) / (ls - sigmas[i - 1])
+                x = x + (dt + s * self._noise_scaler(lt)) * denoised_d
+
+                if stage >= 3 and self._old_denoised_d is not None:
+                    s_u = mx.sum((lam_pos - ls) / scaled) * step_size
+                    denoised_u = (denoised_d - self._old_denoised_d) / ((ls - sigmas[i - 2]) / 2)
+                    x = x + ((dt**2) / 2 + s_u * self._noise_scaler(lt)) * denoised_u
+                self._old_denoised_d = denoised_d
+
+            if self.s_noise > 0:
+                self._key, sub = mx.random.split(self._key)
+                noise = mx.random.normal(x.shape, key=sub)
+                var = lt**2 - (ls**2) * (r**2)
+                std = mx.sqrt(mx.maximum(var, 0.0))
+                x = x + noise * self.s_noise * std
+
+            self._old_denoised = denoised
+            return x
+
+        ErSdeStepper.step = step
+        ErSdeStepper._mlxdiffusion_sigma_cache = True
+    except Exception:
+        return
+
+
+def _install_zit_dynamic_padding(pipe):
+    if os.environ.get("MLX_DISABLE_ZIT_DYNAMIC_PADDING") == "1":
+        return
+    tokenizers = getattr(pipe, "tokenizers", None)
+    tokenizer = tokenizers.get("z_image") if hasattr(tokenizers, "get") else None
+    if tokenizer is not None and getattr(tokenizer, "padding", None) == "max_length":
+        tokenizer.padding = "longest"
 
 
 def _install_rope_cache(model_id: str):
@@ -1036,16 +1539,21 @@ def _install_rope_cache(model_id: str):
     if spec in _ROPE_CACHE_INSTALLED:
         return
     orig = cls.__call__
-    cache = {}
+    cache = OrderedDict()
 
     def _call(self, ids):
         key = (ids.shape, str(ids.dtype), tuple(ids.reshape(-1).tolist()))
         hit = cache.get(key)
         if hit is None:
             hit = orig(self, ids)
-            if len(cache) > 8:
-                cache.clear()
             cache[key] = hit
+            total = sum(_value_bytes(v) for v in cache.values())
+            while cache and (len(cache) > 8 or total > 8 * (1 << 20)):
+                _, value = cache.popitem(last=False) if isinstance(cache, OrderedDict) else (None, None)
+                if value is None:
+                    cache.clear()
+                    break
+                total -= _value_bytes(value)
         return hit
 
     cls.__call__ = _call
@@ -1058,16 +1566,21 @@ _ROPE_CACHE_INSTALLED = set()
 
 def _get_pipeline(model_id: str, quantization: int, loras: list[dict], variant: str = "standard", phase_cb=None):
     global _pipeline, _current_pipeline_key, _current_pipeline_model
+    loras = sorted(_normalize_loras(loras), key=lambda item: item["path"])
     key = _make_pipeline_key(model_id, quantization, loras, variant)
     if _pipeline is not None and _current_pipeline_key == key:
+        _kill_qwen_process()
+        _kill_sdxl_daemon()
         return _pipeline
     info = get_model_info(model_id)
+    if not info:
+        raise ValueError(f"unknown model: {model_id}")
     if phase_cb is not None:
         if is_model_cached(model_id):
             phase_cb("loading_model", f"Loading {info['label']} weights into Apple Silicon unified memory...")
         else:
             phase_cb("downloading", f"Downloading {info['label']} weights from repository...")
-    # exclusive residency: kill the SDXL daemon and completely drop previous mflux model & Metal cache
+    _kill_qwen_process()
     _kill_sdxl_daemon()
     _drop_mflux_pipeline()
     scales = [l.get("scale", 1.0) for l in loras]
@@ -1129,12 +1642,14 @@ def _get_pipeline(model_id: str, quantization: int, loras: list[dict], variant: 
             lora_scales=scales or None,
             bake_lora=False,  # runtime fp16 adapters — baking erodes deltas in q4 weights
         )
+        _install_zit_dynamic_padding(_pipeline)
     elif model_id == "krea2-turbo":
         from mflux.models.krea2 import Krea2
         import mlx.core as mx
         import mlx.nn as nn
 
-        local = DATA_DIR / "models" / "krea2-turbo-q4"
+        _install_krea_sampler_scalar_cache()
+        local = ASSET_DIR / "models" / "krea2-turbo-q4"
         _pipeline = Krea2(
             quantize=4,
             model_path=local_arg or str(local),
@@ -1166,6 +1681,8 @@ def _get_pipeline(model_id: str, quantization: int, loras: list[dict], variant: 
     _current_pipeline_key = key
     _current_pipeline_model = model_id
     _prompt_cache.clear()
+    if model_id in ("flux2-klein-4b", "flux2-klein-9b"):
+        _install_flux_text_encoder_tail_trim(_pipeline)
     if model_id in ("flux2-klein-4b", "flux2-klein-9b"):
         if os.environ.get("MLX_DISABLE_ROPE_CACHE") != "1":
             _install_rope_cache(model_id)
@@ -1219,6 +1736,125 @@ def _enrich_loras_with_registry(loras: list[dict] | None) -> list[dict]:
         enriched.append(entry)
     return enriched
 
+def _validate_dimensions(width, height, minfo):
+    try:
+        width = int(width)
+        height = int(height)
+    except (TypeError, ValueError) as e:
+        raise ValueError("width and height must be integers") from e
+    if width < 128 or height < 128 or width > 2048 or height > 2048:
+        raise ValueError("width and height must be between 128 and 2048")
+    alignment = 8 if minfo.get("engine") == "sdxl" else 16
+    if width % alignment or height % alignment:
+        raise ValueError(f"{minfo['label']} dimensions must be multiples of {alignment}")
+    return width, height
+
+
+def _validate_sampler(sampler, minfo):
+    allowed = minfo.get("samplers") or []
+    if not allowed:
+        value = str(sampler or "").lower()
+        model_id = minfo.get("id")
+        accepted = {
+            "flux2-klein-4b": {"euler", "flow_match_euler_discrete"},
+            "flux2-klein-9b": {"euler", "flow_match_euler_discrete"},
+            "z-image-turbo": {"euler", "linear", "flow_match_euler_discrete"},
+            "krea2-turbo": {"euler", "er_sde", "linear"},
+        }.get(model_id, set())
+        if value and value not in accepted:
+            raise ValueError(f"{minfo['label']} does not support custom samplers")
+        return "Euler"
+    value = sampler or (minfo.get("default_sampler") or allowed[0])
+    if value not in allowed:
+        raise ValueError(f"unsupported sampler for {minfo['label']}: {value}")
+    return value
+
+
+def _effective_guidance(minfo, guidance, negative_prompt=""):
+    if not minfo.get("supports_guidance"):
+        return 1.0
+    value = minfo.get("default_guidance", 1.0) if guidance is None else guidance
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError("guidance must be numeric") from e
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("guidance must be a finite non-negative number")
+    if minfo.get("id") == "qwen-image-2.1" and negative_prompt and value <= 1.0:
+        return 3.0
+    return value
+
+
+def _effective_quantization(model_id, quantization):
+    try:
+        value = int(quantization)
+    except (TypeError, ValueError) as e:
+        raise ValueError("quantization must be an integer") from e
+    if model_id in ("krea2-turbo", "qwen-image-2.1"):
+        if value != 4:
+            raise ValueError(f"{model_id} supports only 4-bit quantization")
+        return 4
+    if value not in (4, 8):
+        raise ValueError("quantization must be 4 or 8")
+    return value
+
+
+def _validate_reference_capability(minfo, ref_paths, image_strength):
+    if ref_paths:
+        if not minfo.get("supports_ref"):
+            raise ValueError(f"reference images are not supported on {minfo['label']}")
+        maximum = int(minfo.get("max_reference_images") or 1)
+        if len(ref_paths) > maximum:
+            raise ValueError(
+                f"{minfo['label']} accepts at most {maximum} reference image(s)"
+            )
+    if image_strength is not None:
+        try:
+            strength = float(image_strength)
+        except (TypeError, ValueError) as e:
+            raise ValueError("image_strength must be numeric") from e
+        if not math.isfinite(strength) or not 0.0 < strength <= 1.0:
+            raise ValueError("image_strength must be in the interval (0, 1]")
+
+
+def _resolve_reference_path(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw or "\x00" in raw:
+        raise ValueError("invalid reference image path")
+    candidate = Path(raw).expanduser()
+    roots = (GENERATED_DIR.resolve(), (DATA_DIR / "uploads").resolve())
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        if not any(resolved.is_relative_to(root) for root in roots):
+            raise ValueError("reference image is outside the gallery and uploads directories")
+        return str(resolved)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", raw):
+        raise ValueError("invalid reference image name")
+    names = [raw]
+    if not Path(raw).suffix:
+        names.extend(f"{raw}{ext}" for ext in (".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"))
+    for root in roots:
+        for name in names:
+            option = (root / name).resolve()
+            if option.is_file() and option.is_relative_to(root):
+                return str(option)
+    raise ValueError(f"reference image not found: {raw}")
+
+
+def _qwen_local_model(minfo):
+    local = resolve_local_model_path("qwen-image-2.1")
+    return str(local.resolve()) if local is not None else str(minfo.get("repo") or "mlx-community/Qwen-Image-2.1-MLX-4bit")
+
+
+def _flow_scheduler_id(model_id):
+    return {
+        "flux2-klein-4b": "flow_match_euler_discrete",
+        "flux2-klein-9b": "flow_match_euler_discrete",
+        "z-image-turbo": "linear",
+        "krea2-turbo": "er_sde",
+    }.get(model_id)
+
+
 def generate(
     prompt: str,
     width: int = 1024,
@@ -1243,28 +1879,51 @@ def generate(
     max_pixels: int | None = None,  # per-request overridable hard pixel cap (defaults to model max_pixels)
 ) -> dict:
     """Blocking generation. Caller must hold no other heavy work."""
+    if loras is not None:
+        if not isinstance(loras, list) or len(loras) > 16:
+            raise ValueError("LoRA list must contain at most 16 entries")
+        if any(not isinstance(lora, dict) or not lora.get("path") for lora in loras):
+            raise ValueError("each LoRA must contain a path")
+        for lora in loras:
+            try:
+                scale = float(lora.get("scale", 1.0))
+            except (TypeError, ValueError) as e:
+                raise ValueError("LoRA scales must be numeric") from e
+            if not math.isfinite(scale) or not 0.0 <= scale <= 10.0:
+                raise ValueError("LoRA scales must be between 0 and 10")
     loras = _enrich_loras_with_registry(loras)
     minfo = get_model_info(model)
-    if minfo["id"] == "qwen-image-2.1":
-        # Size caps were removed 2026-09-22 (user decision), but 1024² CONFIRMED
-        # OOM in the bf16 VAE decode on 16GB (Metal kIOGPU...OutOfMemory) and can
-        # wedge the worker. Refuse the >768² envelope with a clean error instead.
-        if width * height > 589824:  # 768×768 = 589824 px
-            raise ValueError(
-                f"{minfo['label']}: resolutions above 768×768 (589k px) OOM the bf16 VAE "
-                f"decode on 16GB Apple Silicon and can crash the app. Keep ≤ 512×768 / 768×512 / 768×768."
-            )
-    if minfo.get("engine") == "sdxl":
-        chosen_sampler = sampler or (minfo.get("samplers")[0] if minfo.get("samplers") else "euler_trailing")
-        return _generate_sdxl(
-            prompt=prompt, width=width, height=height, steps=steps,
-            guidance=guidance, seed=seed, loras=loras, progress_cb=progress_cb,
-            phase_cb=phase_cb,
-            model=model, cancel_event=cancel_event,
-            negative_prompt=negative_prompt, sampler=chosen_sampler,
-            cache_interval=cache_interval,
-            output_format=output_format, stealth=stealth,
-            fast_vae=fast_vae)
+    if not minfo:
+        raise ValueError(f"unknown model: {model}")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt is required")
+    if str(output_format).lower() not in ("png", "jpeg", "jpg"):
+        raise ValueError("output_format must be png or jpeg")
+    if len(prompt.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        raise ValueError("prompt exceeds the 128 KiB limit")
+    try:
+        steps = int(steps)
+    except (TypeError, ValueError) as e:
+        raise ValueError("steps must be an integer") from e
+    if steps < 1 or steps > 50:
+        raise ValueError("steps must be between 1 and 50")
+    width, height = _validate_dimensions(width, height, minfo)
+    quantization = _effective_quantization(minfo["id"], quantization)
+    if loras and not minfo.get("supports_loras"):
+        raise ValueError(
+            f"LoRAs are not supported on {minfo['label']} (needs {minfo.get('lora_format', 'compatible')}-format LoRAs)"
+        )
+    if not minfo.get("supports_negative"):
+        negative_prompt = ""
+    if len(str(negative_prompt).encode("utf-8")) > _MAX_PROMPT_BYTES:
+        raise ValueError("negative prompt exceeds the 128 KiB limit")
+    chosen_sampler = _validate_sampler(sampler, minfo)
+    effective_guidance = _effective_guidance(minfo, guidance, negative_prompt)
+    if minfo["id"] == "qwen-image-2.1" and width * height > 589824:
+        raise ValueError(
+            f"{minfo['label']}: resolutions above 768×768 (589k px) OOM the bf16 VAE "
+            f"decode on 16GB Apple Silicon and can crash the app. Keep ≤ 512×768 / 768×512 / 768×768."
+        )
 
     ref_paths: list[str] = []
     if reference_images:
@@ -1273,46 +1932,8 @@ def generate(
                 ref_paths.append(p.strip())
 
     if ref_paths:
-        if minfo["id"] not in ("flux2-klein-4b", "flux2-klein-9b", "z-image-turbo", "krea2-turbo", "qwen-image-2.1"):
-            raise ValueError(
-                f"Reference images are not supported on {minfo['label']} (FLUX.2-klein / Z-Image / Krea2 / Qwen-Image 2.1 only)")
-        if len(ref_paths) > 1 and minfo["id"] not in ("flux2-klein-4b", "flux2-klein-9b"):
-            raise ValueError(
-                f"Multi-reference images (up to 10) are currently supported on FLUX.2-klein only"
-            )
-        resolved_ref_paths: list[str] = []
-        for p in ref_paths:
-            cand = Path(p).expanduser()
-            if cand.is_absolute() and cand.exists():
-                resolved_ref_paths.append(str(cand.resolve()))
-            elif (GENERATED_DIR / p).exists():
-                resolved_ref_paths.append(str((GENERATED_DIR / p).resolve()))
-            elif (GENERATED_DIR / f"{p}.png").exists():
-                resolved_ref_paths.append(str((GENERATED_DIR / f"{p}.png").resolve()))
-            elif (GENERATED_DIR / f"{p}.jpeg").exists():
-                resolved_ref_paths.append(str((GENERATED_DIR / f"{p}.jpeg").resolve()))
-            elif (GENERATED_DIR / f"{p}.jpg").exists():
-                resolved_ref_paths.append(str((GENERATED_DIR / f"{p}.jpg").resolve()))
-            elif (GENERATED_DIR / f"{p}.webp").exists():
-                resolved_ref_paths.append(str((GENERATED_DIR / f"{p}.webp").resolve()))
-            elif (GENERATED_DIR / f"{p}.heic").exists():
-                resolved_ref_paths.append(str((GENERATED_DIR / f"{p}.heic").resolve()))
-            elif (GENERATED_DIR / f"{p}.heif").exists():
-                resolved_ref_paths.append(str((GENERATED_DIR / f"{p}.heif").resolve()))
-            elif (DATA_DIR / "uploads" / p).exists():
-                resolved_ref_paths.append(str((DATA_DIR / "uploads" / p).resolve()))
-            elif (DATA_DIR / "uploads" / f"{p}.png").exists():
-                resolved_ref_paths.append(str((DATA_DIR / "uploads" / f"{p}.png").resolve()))
-            elif (DATA_DIR / "uploads" / f"{p}.webp").exists():
-                resolved_ref_paths.append(str((DATA_DIR / "uploads" / f"{p}.webp").resolve()))
-            elif (DATA_DIR / "uploads" / f"{p}.heic").exists():
-                resolved_ref_paths.append(str((DATA_DIR / "uploads" / f"{p}.heic").resolve()))
-            elif (DATA_DIR / "uploads" / f"{p}.heif").exists():
-                resolved_ref_paths.append(str((DATA_DIR / "uploads" / f"{p}.heif").resolve()))
-            elif (ROOT / p).exists():
-                resolved_ref_paths.append(str((ROOT / p).resolve()))
-            else:
-                raise ValueError(f"reference image not found: {p}")
+        _validate_reference_capability(minfo, ref_paths, image_strength)
+        resolved_ref_paths = [_resolve_reference_path(p) for p in ref_paths]
 
         # If any reference image is raw HEIC/HEIF, normalize to PNG to prevent codec issues in downstream MLX
         normalized_ref_paths: list[str] = []
@@ -1347,47 +1968,53 @@ def generate(
             else:
                 normalized_ref_paths.append(p)
         ref_paths = normalized_ref_paths
+    else:
+        _validate_reference_capability(minfo, [], image_strength)
 
-    # Strength-based img2img (Z-Image / Krea2) quietly falls back to txt2img in
-    # mflux when strength is None (init_time_step = 0). Default to the same 0.6
-    # the frontend uses for Z-Image so omitted strength never silently ignores
-    # the reference. FLUX.2 edit conditioning ignores strength.
+    if image_strength is not None and not ref_paths:
+        raise ValueError("image_strength requires at least one reference image")
     if ref_paths and image_strength is None:
         image_strength = 0.6
 
-    if loras and not minfo.get("supports_loras"):
-        raise ValueError(
-            f"LoRAs are not supported on {minfo['label']} (needs {minfo['lora_format']}-format LoRAs)"
-        )
-    if not minfo["supports_guidance"]:
-        guidance = None
     max_side = minfo.get("max_side")
     cap_pixels = minfo.get("max_pixels")
-    # A per-request override can tighten the model's pixel budget further
-    # (never loosen it), e.g. Qwen-Image 2.1's 512×768-safe default that the
-    # UI lets users tune (max_pixels from the frontend params tab).
-    if max_pixels is not None and (cap_pixels is None or max_pixels < cap_pixels):
-        cap_pixels = max_pixels
+    if max_pixels is not None:
+        try:
+            requested_cap = int(max_pixels)
+        except (TypeError, ValueError) as e:
+            raise ValueError("max_pixels must be an integer") from e
+        if requested_cap < 256 * 256:
+            raise ValueError("max_pixels must be at least 256×256")
+        if cap_pixels is None or requested_cap < cap_pixels:
+            cap_pixels = requested_cap
     if max_side:
-        width = min(width, max_side)
-        height = min(height, max_side)
+        width = min(width, int(max_side))
+        height = min(height, int(max_side))
     if cap_pixels and width * height > cap_pixels:
         scale = (cap_pixels / (width * height)) ** 0.5
         width = max(256, int(width * scale) // 16 * 16)
         height = max(256, int(height * scale) // 16 * 16)
+    if cap_pixels and width * height > cap_pixels:
+        raise ValueError("dimensions cannot be reduced below the requested pixel cap")
+
+    if minfo.get("engine") == "sdxl":
+        return _generate_sdxl(
+            prompt=prompt, width=width, height=height, steps=steps,
+            guidance=effective_guidance, seed=seed, loras=loras, progress_cb=progress_cb,
+            phase_cb=phase_cb, model=model, cancel_event=cancel_event,
+            negative_prompt=negative_prompt, sampler=chosen_sampler,
+            cache_interval=cache_interval, quantization=quantization,
+            output_format=output_format, stealth=stealth, fast_vae=fast_vae,
+        )
     if minfo["id"] == "qwen-image-2.1":
-        # Qwen-Image 2.1 runs in an isolated per-job subprocess. The long-lived
-        # API worker accumulates process-global state that silently corrupts the
-        # qwen denoise into magenta/pink output, while every fresh interpreter
-        # reproduces the identical seed/prompt/steps as clean content. Routing
-        # qwen to its own fresh process decouples it from that state entirely.
         return _generate_qwen_subprocess(
             prompt=prompt, width=width, height=height, steps=steps,
-            guidance=guidance, seed=seed, progress_cb=progress_cb,
+            guidance=effective_guidance, seed=seed, progress_cb=progress_cb,
             phase_cb=phase_cb, model=model, cancel_event=cancel_event,
-            negative_prompt=negative_prompt, sampler=sampler,
+            negative_prompt=negative_prompt, sampler=chosen_sampler,
             ref_paths=ref_paths, image_strength=image_strength,
-            output_format=output_format, stealth=stealth, fast_vae=fast_vae,
+            quantization=quantization, output_format=output_format,
+            stealth=stealth, fast_vae=fast_vae,
         )
     with _lock:
         _cancel_event.clear()
@@ -1395,27 +2022,31 @@ def generate(
         seed = seed if seed is not None else int(time.time())
 
         variant = "standard"
+        scheduler_id = _flow_scheduler_id(minfo["id"])
         is_flux2 = minfo["id"] in ("flux2-klein-4b", "flux2-klein-9b")
         if is_flux2 and ref_paths:
             variant = "edit"
 
-        actual_loras = list(loras or [])[:16]
-        if model == "krea2-turbo" and steps <= 4:
-            krea_distill_path = DATA_DIR / "lora_files" / "krea2_turbo_4step_rank_64_lora_latest.safetensors"
+        actual_loras = sorted(_normalize_loras(list(loras or [])[:16]), key=lambda item: item["path"])
+        if minfo["id"] == "krea2-turbo" and steps <= 4:
+            krea_distill_path = ASSET_DIR / "lora_files" / "krea2_turbo_4step_rank_64_lora_latest.safetensors"
             if not krea_distill_path.exists():
-                krea_distill_path = DATA_DIR / "lora_files" / "krea2_turbo_4step_rank_64_lora.safetensors"
+                krea_distill_path = ASSET_DIR / "lora_files" / "krea2_turbo_4step_rank_64_lora.safetensors"
             if krea_distill_path.exists():
                 has_krea_distill = any(
                     "krea2_turbo_4step" in str(l.get("path", "") if isinstance(l, dict) else l)
                     for l in actual_loras
                 )
                 if not has_krea_distill:
+                    if len(actual_loras) >= 16:
+                        raise ValueError("cannot auto-add the Krea distillation LoRA when 16 LoRAs are already active")
                     actual_loras.append({
                         "path": str(krea_distill_path),
                         "scale": 1.0,
                         "name": "krea2_turbo_4step_rank_64_lora_latest",
                     })
             actual_loras = _enrich_loras_with_registry(actual_loras)
+            actual_loras.sort(key=lambda item: item["path"])
 
         is_already_loaded = (
             _pipeline is not None
@@ -1448,11 +2079,11 @@ def generate(
             else:
                 limit = _wired_limit_bytes()
             if limit > 0:
-                    try:
-                        set_limit = getattr(mx, "set_wired_limit", None) or mx.metal.set_wired_limit
-                        prev_wired = set_limit(limit)
-                    except Exception:
-                        prev_wired = None
+                try:
+                    set_limit = getattr(mx, "set_wired_limit", None) or mx.metal.set_wired_limit
+                    prev_wired = set_limit(limit)
+                except Exception:
+                    prev_wired = None
 
             # Acceleration Hooks: Fast VAE
             if is_flux2:
@@ -1510,6 +2141,7 @@ def generate(
                     restore_callbacks.append(lambda: setattr(pipe, "_decode_latents", orig_zit_decode))
 
             t_infer_start = time.time()
+            sampler_label = chosen_sampler
             if variant == "edit":
                 out = pipe.generate_image(
                     seed=seed,
@@ -1517,8 +2149,9 @@ def generate(
                     num_inference_steps=steps,
                     height=height,
                     width=width,
-                    guidance=guidance if guidance is not None else 1.0,
+                    guidance=effective_guidance,
                     image_paths=[Path(p) for p in ref_paths],
+                    scheduler=scheduler_id,
                 )
             else:
                 gen_kwargs = {
@@ -1527,29 +2160,15 @@ def generate(
                     "num_inference_steps": steps,
                     "height": height,
                     "width": width,
-                    "guidance": guidance if guidance is not None else 1.0,
+                    "guidance": effective_guidance,
                     "image_path": ref_paths[0] if ref_paths else None,
                     "image_strength": image_strength,
                 }
-                sampler_label = sampler or (minfo.get("default_sampler") or "euler_trailing")
-                if model == "qwen-image-2.1":
-                    # true CFG on the Qwen-Image 2.1 port only engages when guidance > 1
-                    # (noise = neg + g*(pos - neg)). Auto-raise guidance when a negative
-                    # prompt is supplied so it actually takes effect instead of being skipped.
-                    eff_guidance = guidance if guidance is not None else 1.0
-                    if negative_prompt and eff_guidance <= 1.0:
-                        eff_guidance = 3.0
-                    gen_kwargs.update(
-                        {
-                            "negative_prompt": negative_prompt or None,
-                            "guidance": eff_guidance,
-                            # default "linear" is mflux's native qwen21 scheduler and is the only one
-                            # verified to render saturated mono-color subjects cleanly; "euler" maps
-                            # to flow_match_euler_discrete (better for scenes, magenta on flat colors).
-                            "scheduler": _QWEN_SCHEDULERS.get((sampler or "linear").lower(), "linear"),
-                        }
-                    )
-                    sampler_label = (sampler or "linear").lower()
+                if minfo.get("supports_negative"):
+                    gen_kwargs["negative_prompt"] = negative_prompt or None
+                if scheduler_id is not None:
+                    gen_kwargs["scheduler"] = scheduler_id
+                sampler_label = chosen_sampler
                 out = pipe.generate_image(**gen_kwargs)
             infer_time = round(time.time() - t_infer_start, 2)
         finally:
@@ -1589,12 +2208,12 @@ def generate(
         meta = {
             "id": image_id,
             "prompt": prompt,
-"negative_prompt": negative_prompt or "",
-                    "sampler": sampler_label,
+            "negative_prompt": negative_prompt or "",
+            "sampler": sampler_label,
             "width": width,
             "height": height,
             "steps": steps,
-            "guidance": guidance if guidance is not None else minfo.get("default_guidance", 1.0),
+            "guidance": effective_guidance,
             "seed": seed,
             "quantization": quantization,
             "loras": actual_loras,
@@ -1610,8 +2229,10 @@ def generate(
             "reference_images": [Path(p).name for p in ref_paths],
             "stealth": stealth,
             "format": fmt,
-            "fast_vae": bool(fast_vae),
+            "fast_vae": bool(fast_vae) and bool(minfo.get("supports_fast_vae")),
         }
+        if scheduler_id is not None:
+            meta["scheduler"] = scheduler_id
         # Strength is meaningful only for strength-based single-ref conditioning
         # (Z-Image / Krea2). FLUX.2 in-context edit ignores strength entirely.
         if ref_paths and variant == "standard":
@@ -1632,7 +2253,7 @@ def generate(
             output_format=fmt,
             stealth=stealth,
         )
-        (GENERATED_DIR / f"{image_id}.json").write_text(json.dumps(meta, indent=2))
+        atomic_write_json(GENERATED_DIR / f"{image_id}.json", meta)
         gc.collect()
         return meta
 
@@ -1640,44 +2261,48 @@ def generate(
 _sdxl_daemon = None
 _sdxl_watchdog = None
 _sdxl_idle_since = None
+_sdxl_reader_messages = None
+_sdxl_reader_done = None
+_sdxl_reader_thread = None
+_sdxl_stderr_thread = None
+_sdxl_stderr_done = None
 SDXL_IDLE_KILL_S = 300
 
 
 def _arm_sdxl_watchdog():
-    """Kill the SDXL daemon after `idle_kill_s_sdxl` idle seconds; it is
-    respawned lazily on the next generate call. A setting of 0 disables."""
     global _sdxl_watchdog, _sdxl_idle_since
     idle_s = _sdxl_idle_kill_s()
-    if idle_s <= 0:
+    proc = _sdxl_daemon
+    if idle_s <= 0 or proc is None or proc.poll() is not None:
         _cancel_sdxl_watchdog()
         return
     if _sdxl_watchdog is not None:
         _sdxl_watchdog.cancel()
     _sdxl_idle_since = time.time()
-    proc = _sdxl_daemon
+    timer_ref = [None]
 
     def _kill():
-        global _sdxl_daemon, _sdxl_watchdog, _current_sdxl_model
+        global _sdxl_daemon, _sdxl_watchdog, _current_sdxl_model, _sdxl_idle_since
         with _lock:
-            try:
-                if proc.poll() is None:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=5.0)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    print("[sdxl] watchdog: idle daemon terminated", flush=True)
-            except Exception:
-                pass
+            if _sdxl_watchdog is not timer_ref[0] or _sdxl_daemon is not proc:
+                return
+            if proc.poll() is None:
+                _terminate_process(proc)
+                _remove_sdxl_pid(proc.pid)
+                print("[sdxl] watchdog: idle daemon terminated", flush=True)
+            _remove_sdxl_pid(proc.pid)
             if _sdxl_daemon is proc:
                 _sdxl_daemon = None
                 _current_sdxl_model = None
-            _sdxl_watchdog = None
-            _sdxl_idle_since = None
+            if _sdxl_watchdog is timer_ref[0]:
+                _sdxl_watchdog = None
+                _sdxl_idle_since = None
 
-    _sdxl_watchdog = threading.Timer(idle_s, _kill)
-    _sdxl_watchdog.daemon = True
-    _sdxl_watchdog.start()
+    timer = threading.Timer(idle_s, _kill)
+    timer.daemon = True
+    timer_ref[0] = timer
+    _sdxl_watchdog = timer
+    timer.start()
 
 
 def _cancel_sdxl_watchdog():
@@ -1710,33 +2335,33 @@ def _sdxl_idle_kill_s() -> int:
 
 
 def _arm_mflux_watchdog():
-    """Release the resident mflux pipeline after `idle_kill_s_mflux` idle seconds;
-    reloaded lazily on the next generate call. A setting of 0 disables the watchdog."""
     global _mflux_watchdog, _mflux_idle_since
     idle_s = _mflux_idle_kill_s()
-    if idle_s <= 0:
+    pipe_ref = _pipeline
+    if idle_s <= 0 or pipe_ref is None:
         _cancel_mflux_watchdog()
         return
     if _mflux_watchdog is not None:
         _mflux_watchdog.cancel()
     _mflux_idle_since = time.time()
-    pipe_ref = _pipeline
+    timer_ref = [None]
 
     def _release():
         global _mflux_watchdog, _mflux_idle_since
         with _lock:
-            try:
-                if _pipeline is pipe_ref and _pipeline is not None:
-                    _drop_mflux_pipeline()
-                    print("[mflux] watchdog: idle pipeline released", flush=True)
-            except Exception:
-                pass
-            _mflux_watchdog = None
-            _mflux_idle_since = None
+            if _mflux_watchdog is not timer_ref[0] or _pipeline is not pipe_ref:
+                return
+            _drop_mflux_pipeline()
+            print("[mflux] watchdog: idle pipeline released", flush=True)
+            if _mflux_watchdog is timer_ref[0]:
+                _mflux_watchdog = None
+                _mflux_idle_since = None
 
-    _mflux_watchdog = threading.Timer(idle_s, _release)
-    _mflux_watchdog.daemon = True
-    _mflux_watchdog.start()
+    timer = threading.Timer(idle_s, _release)
+    timer.daemon = True
+    timer_ref[0] = timer
+    _mflux_watchdog = timer
+    timer.start()
 
 
 def _cancel_mflux_watchdog():
@@ -1748,91 +2373,33 @@ def _cancel_mflux_watchdog():
 
 
 def rearm_engine_watchdogs():
-    """Reschedule any armed idle watchdogs with the current persisted settings.
-
-    Safe mid-flight: never touches a running generation or resident pipeline —
-    it only re-arms an already-armed watchdog that fires after a generation ends.
-    If a generation is currently running the lock is busy, so re-arming is
-    skipped; the persisted value still applies automatically on the next idle
-    arm (generations always re-arm watchdogs with the current settings).
-    """
-    global _mflux_watchdog, _mflux_idle_since, _sdxl_watchdog, _sdxl_idle_since
     if not _lock.acquire(blocking=False):
         return
     try:
-        if _mflux_watchdog is not None and _mflux_watchdog.is_alive():
-            _mflux_watchdog.cancel()
-            pipe_ref = _pipeline
-            since = _mflux_idle_since
-            idle_s = _mflux_idle_kill_s()
-
-            def _release():
-                global _mflux_watchdog, _mflux_idle_since
-                with _lock:
-                    try:
-                        if _pipeline is pipe_ref and _pipeline is not None:
-                            _drop_mflux_pipeline()
-                            print("[mflux] watchdog: idle pipeline released", flush=True)
-                    except Exception:
-                        pass
-                    _mflux_watchdog = None
-                    _mflux_idle_since = None
-
-            if idle_s > 0:
-                _mflux_watchdog = threading.Timer(idle_s, _release)
-                _mflux_watchdog.daemon = True
-                _mflux_watchdog.start()
-                _mflux_idle_since = since
-            else:
-                _mflux_watchdog = None
-                _mflux_idle_since = None
-
-        if _sdxl_watchdog is not None and _sdxl_watchdog.is_alive():
-            _sdxl_watchdog.cancel()
-            proc = _sdxl_daemon
-            since = _sdxl_idle_since
-            idle_s = _sdxl_idle_kill_s()
-
-            def _kill():
-                global _sdxl_daemon, _sdxl_watchdog, _current_sdxl_model
-                with _lock:
-                    try:
-                        if proc.poll() is None:
-                            proc.kill()
-                            try:
-                                proc.wait(timeout=5.0)
-                            except subprocess.TimeoutExpired:
-                                pass
-                            print("[sdxl] watchdog: idle daemon terminated", flush=True)
-                    except Exception:
-                        pass
-                    if _sdxl_daemon is proc:
-                        _sdxl_daemon = None
-                        _current_sdxl_model = None
-                    _sdxl_watchdog = None
-                    _sdxl_idle_since = None
-
-            if idle_s > 0:
-                _sdxl_watchdog = threading.Timer(idle_s, _kill)
-                _sdxl_watchdog.daemon = True
-                _sdxl_watchdog.start()
-                _sdxl_idle_since = since
-            else:
-                _sdxl_watchdog = None
-                _sdxl_idle_since = None
+        _cancel_mflux_watchdog()
+        _cancel_sdxl_watchdog()
+        if _pipeline is not None and _mflux_idle_kill_s() > 0:
+            _arm_mflux_watchdog()
+        if _sdxl_daemon is not None and _sdxl_daemon.poll() is None and _sdxl_idle_kill_s() > 0:
+            _arm_sdxl_watchdog()
     finally:
         _lock.release()
 
 
 def _drop_mflux_pipeline():
-    """Free the resident mflux pipeline (Krea2/FLUX ~10GB). Needed before an
-    SDXL run or between model switches: two resident engines = 20GB+ on a 16GB Mac = thrash."""
     global _pipeline, _current_pipeline_key, _current_pipeline_model, _prompt_cache
+    _kill_qwen_process()
     _cancel_mflux_watchdog()
     _pipeline = None
     _current_pipeline_key = None
     _current_pipeline_model = None
     _prompt_cache.clear()
+    _taef_models.clear()
+    try:
+        from taesd_mlx import clear_taesd_cache
+        clear_taesd_cache()
+    except Exception:
+        pass
     gc.collect()
     try:
         import mlx.core as mx
@@ -1842,29 +2409,109 @@ def _drop_mflux_pipeline():
 
 
 def _kill_sdxl_daemon():
-    """Terminate the SDXL engine process so its ~11GB are freed before an
-    mflux model loads."""
-    global _sdxl_daemon, _current_sdxl_model, _current_pipeline_model
+    global _sdxl_daemon, _current_sdxl_model
+    global _sdxl_reader_messages, _sdxl_reader_done, _sdxl_reader_thread
+    global _sdxl_stderr_thread, _sdxl_stderr_done
+    proc = _sdxl_daemon
+    had_sdxl = proc is not None or _current_sdxl_model is not None
     _cancel_sdxl_watchdog()
-    _current_sdxl_model = None
-    _current_pipeline_model = None
-    if _sdxl_daemon is not None:
-        try:
-            if _sdxl_daemon.poll() is None:
-                _sdxl_daemon.kill()
-                try:
-                    _sdxl_daemon.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    pass
-        except Exception:
-            pass
+    if proc is not None:
+        _terminate_process(proc)
+        _remove_sdxl_pid(proc.pid)
+    _join_reader(_sdxl_stderr_thread)
+    _join_reader(_sdxl_reader_thread)
+    if _sdxl_daemon is proc:
         _sdxl_daemon = None
+    _current_sdxl_model = None
+    _sdxl_reader_messages = None
+    _sdxl_reader_done = None
+    _sdxl_reader_thread = None
+    _sdxl_stderr_thread = None
+    _sdxl_stderr_done = None
+    if had_sdxl:
         try:
             import mlx.core as mx
             mx.clear_cache()
-            gc.collect()
         except Exception:
             pass
+        gc.collect()
+
+
+_SDXL_PID_FILE = DATA_DIR / ".tmp" / "sdxl_daemon.pid"
+
+
+def _read_sdxl_pid() -> int | None:
+    try:
+        value = int(_SDXL_PID_FILE.read_text("utf-8").strip())
+        return value if value > 1 else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _write_sdxl_pid(pid: int):
+    _SDXL_PID_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = _SDXL_PID_FILE.with_name(f".{_SDXL_PID_FILE.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(str(pid), encoding="utf-8")
+        os.replace(tmp, _SDXL_PID_FILE)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _remove_sdxl_pid(pid: int | None = None):
+    current = _read_sdxl_pid()
+    if current is not None and (pid is None or current == pid):
+        try:
+            _SDXL_PID_FILE.unlink()
+        except OSError:
+            pass
+
+
+def _cleanup_stale_sdxl_daemon() -> bool:
+    pid = _read_sdxl_pid()
+    if pid is None:
+        return True
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        _remove_sdxl_pid(pid)
+        return True
+    except PermissionError:
+        return False
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=2)
+        command = result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if not command:
+        return False
+    if "sdxl_engine.py" not in command or "--serve" not in command:
+        _remove_sdxl_pid(pid)
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _remove_sdxl_pid(pid)
+        return True
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            _remove_sdxl_pid(pid)
+            return True
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    _remove_sdxl_pid(pid)
+    return True
 
 
 _sdxl_stderr_tail = collections.deque(maxlen=100)
@@ -1872,84 +2519,106 @@ _sdxl_stderr_tail = collections.deque(maxlen=100)
 
 def _drain_stderr(proc):
     try:
-        for line in iter(proc.stderr.readline, ""):
-            _sdxl_stderr_tail.append(line)
+        _read_process_stream(proc.stderr, lambda line: _sdxl_stderr_tail.append(f"{line}\n"))
     except Exception:
         pass
 
 
 def _get_sdxl_daemon():
-    """Persistent SDXL engine process — model loads once, stays resident."""
-    global _sdxl_daemon
+    global _sdxl_daemon, _sdxl_reader_messages, _sdxl_reader_done, _sdxl_reader_thread
+    global _sdxl_stderr_thread, _sdxl_stderr_done
     if _sdxl_daemon is not None and _sdxl_daemon.poll() is None:
         return _sdxl_daemon
-    # Guarantee a single engine: kill any orphan daemon from a previous
-    # backend instance before spawning ours (two resident engines could
-    # otherwise run generations in parallel and thrash memory).
-    subprocess.run(
-        ["pkill", "-f", "sdxl_engine.py --serve"],
-        capture_output=True)
-    time.sleep(0.5)
-    engine = Path(__file__).parent.parent / "venv-sdxl" / "bin" / "python"
+    if _sdxl_daemon is not None:
+        _kill_sdxl_daemon()
+    if not _cleanup_stale_sdxl_daemon():
+        raise RuntimeError("could not verify the previous SDXL daemon")
     script = Path(__file__).parent / "sdxl_engine.py"
+    engine = Path(__file__).parent.parent / "venv-sdxl" / "bin" / "python"
     _sdxl_stderr_tail.clear()
-    _sdxl_daemon = subprocess.Popen(
+    proc = subprocess.Popen(
         [str(engine), str(script), "--serve"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, bufsize=1,
-        cwd=str(Path(__file__).resolve().parent))
-    threading.Thread(target=_drain_stderr, args=(_sdxl_daemon,), daemon=True).start()
-    return _sdxl_daemon
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        bufsize=0,
+        start_new_session=True,
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    proc._mlx_process_group = True
+    _write_sdxl_pid(proc.pid)
+    _sdxl_daemon = proc
+    _sdxl_reader_messages, _sdxl_reader_done, _sdxl_reader_thread = _start_json_reader(proc)
+    _sdxl_stderr_done, _sdxl_stderr_thread = _start_stderr_reader(proc, _sdxl_stderr_tail)
+    return proc
 
 
 def _generate_sdxl(prompt, width, height, steps, guidance, seed, loras,
                    progress_cb, model, cancel_event, negative_prompt, sampler,
-                   cache_interval=1, output_format="png", stealth=False, fast_vae=True,
-                   phase_cb=None):
-    """Run F42 SDXL via the venv-sdxl subprocess engine (mlx-diffuser)."""
+                   cache_interval=1, quantization=4, output_format="png", stealth=False,
+                   fast_vae=True, phase_cb=None):
+    global _current_sdxl_model
+    raw_image_path = None
     with _lock:
+        _kill_qwen_process()
         _cancel_sdxl_watchdog()
         try:
-            # exclusive residency: drop the mflux pipeline before SDXL loads
             _drop_mflux_pipeline()
             minfo = get_model_info(model) or {}
             sampler = sampler or (minfo.get("samplers")[0] if minfo.get("samplers") else "euler_trailing")
             seed = seed if seed is not None else int(time.time())
-            t0 = time.time()
+            try:
+                cache_interval = int(cache_interval)
+            except (TypeError, ValueError) as e:
+                raise ValueError("cache_interval must be an integer") from e
+            if not 1 <= cache_interval <= 10:
+                raise ValueError("cache_interval must be between 1 and 10")
             image_id = uuid.uuid4().hex
             fmt = "jpeg" if str(output_format).lower() in ("jpeg", "jpg") else "png"
             raw_image_path = GENERATED_DIR / f"{image_id}.raw.png"
             final_image_path = GENERATED_DIR / f"{image_id}.{fmt}"
-            actual_loras = list(loras or [])
-            lightning_path = str(DATA_DIR / "SDXL" / "sdxl_lightning_4step_lora.safetensors")
-            # Only inject external Lightning LoRA if the base model is NOT already distilled (e.g. F42 SDXL)
+            actual_loras = _normalize_loras(list(loras or []))
+            lightning_path = str(ASSET_DIR / "SDXL" / "sdxl_lightning_4step_lora.safetensors")
             if not minfo.get("is_distilled"):
                 if (steps <= 4 or sampler in ("euler_trailing", "trailing")) and os.path.exists(lightning_path):
-                    has_lightning = any(Path(l.get("path", "")).name == "sdxl_lightning_4step_lora.safetensors" for l in actual_loras)
+                    has_lightning = any(
+                        Path(str(l.get("path", ""))).name == "sdxl_lightning_4step_lora.safetensors"
+                        for l in actual_loras
+                    )
                     if not has_lightning:
+                        if len(actual_loras) >= 16:
+                            raise ValueError("cannot auto-add the SDXL Lightning LoRA when 16 LoRAs are already active")
                         actual_loras.append({"path": lightning_path, "scale": 1.0})
-            tile_vae = (width * height >= 768 * 768)
+            actual_loras = _enrich_loras_with_registry(actual_loras)
+            sdxl_wired_limit = _wired_limit_bytes()
+            if sdxl_wired_limit > 0:
+                sdxl_wired_limit = min(sdxl_wired_limit, int(6.5 * (1 << 30)))
+            tile_vae = width * height >= 768 * 768
             model_dir = str(
                 resolve_local_model_path(model)
                 or minfo.get("model_dir")
-                or (DATA_DIR / "models" / "juggernaut-xl-lightning")
+                or (ASSET_DIR / "models" / "juggernaut-xl-lightning")
             )
-            def_guidance = minfo.get("default_guidance")
-            if def_guidance is None:
-                def_guidance = 1.0 if minfo.get("is_distilled", True) else 2.4
             req = {
-                "prompt": prompt, "negative_prompt": negative_prompt or "",
-                "height": height - height % 8, "width": width - width % 8,
-                "steps": steps, "guidance": guidance if guidance is not None else def_guidance,
-                "seed": seed, "sampler": sampler, "image_id": image_id,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt or "",
+                "height": height,
+                "width": width,
+                "steps": steps,
+                "guidance": guidance,
+                "seed": seed,
+                "sampler": sampler,
+                "image_id": image_id,
                 "dest": str(raw_image_path),
                 "loras": actual_loras,
-                "cache_interval": max(1, int(cache_interval)),
+                "cache_interval": cache_interval,
                 "tile_vae": tile_vae,
                 "model_dir": model_dir,
                 "fast_vae": bool(fast_vae),
+                "quantize_unet": 4,
+                "wired_limit_bytes": sdxl_wired_limit,
             }
-            global _current_sdxl_model
             is_daemon_alive = (
                 _sdxl_daemon is not None
                 and _sdxl_daemon.poll() is None
@@ -1963,71 +2632,91 @@ def _generate_sdxl(prompt, width, height, steps, guidance, seed, loras,
             _cancel_event.clear()
             proc = _get_sdxl_daemon()
             _current_sdxl_model = model_dir
-            proc.stdin.write(json.dumps(req) + "\n")
-            proc.stdin.flush()
+            _write_process_request(
+                proc,
+                (json.dumps(req, separators=(",", ":")) + "\n").encode("utf-8"),
+                (cancel_event, _cancel_event),
+                _engine_timeout("SDXL_ENGINE_TIMEOUT_S"),
+            )
             result = None
             while True:
-                if (cancel_event is not None and cancel_event.is_set()) or _cancel_event.is_set():
-                    # Abort mid-generation: the engine has no interrupt protocol,
-                    # so kill it (watchdog/next call respawns it cleanly).
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    _kill_sdxl_daemon()
-                    raise GenerationCancelled()
-                r, _, _ = select.select([proc.stdout], [], [], 0.2)
-                if not r:
-                    if proc.poll() is not None:
-                        err = "".join(_sdxl_stderr_tail)[-2000:] or "process exited unexpectedly"
-                        raise RuntimeError(f"SDXL engine died: {err}")
-                    continue
-                line = proc.stdout.readline()
-                if not line:
+                line = _read_engine_message(
+                    proc,
+                    _sdxl_reader_messages,
+                    _sdxl_reader_done,
+                    (cancel_event, _cancel_event),
+                    _engine_timeout("SDXL_ENGINE_TIMEOUT_S"),
+                    "SDXL engine",
+                    _sdxl_stderr_tail,
+                )
+                if line is None:
                     err = "".join(_sdxl_stderr_tail)[-2000:] or "EOF on stdout"
                     raise RuntimeError(f"SDXL engine died: {err}")
-                line = line.strip()
-                if not line:
-                    continue
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(payload, dict):
-                    if "progress" in payload:
-                        if progress_cb is not None:
-                            progress_cb(payload["progress"]["step"] - 1)
-                    elif "phase" in payload:
-                        if phase_cb is not None:
-                            phase_cb(payload["phase"], payload.get("detail", ""))
-                    else:
-                        result = payload
-                        break
-            if "error" in result:
+                if not isinstance(payload, dict):
+                    continue
+                if "progress" in payload:
+                    step = payload["progress"].get("step")
+                    if progress_cb is not None and isinstance(step, int):
+                        progress_cb(max(0, step - 1))
+                elif "phase" in payload:
+                    if phase_cb is not None:
+                        phase_cb(str(payload["phase"]), str(payload.get("detail", "")))
+                else:
+                    result = payload
+                    break
+            if result is None:
+                raise RuntimeError("SDXL engine returned no result")
+            if result.get("error"):
                 _kill_sdxl_daemon()
-                raise RuntimeError(result["error"])
+                raise RuntimeError(str(result["error"]))
             if phase_cb is not None:
                 phase_cb("saving", "Finalizing image and metadata...")
-            elapsed = result["generation_time"]
+            actual_w = int(result.get("width", width))
+            actual_h = int(result.get("height", height))
+            actual_sampler = result.get("sampler") or sampler
+            actual_guidance = float(result.get("guidance", guidance if guidance is not None else 1.0))
+            actual_quantization = result.get("quantization", quantization or 4)
+            actual_loras = result.get("loras") or actual_loras
+            raw_bytes = raw_image_path.read_bytes()
+            expected_bytes = actual_w * actual_h * 3
+            if len(raw_bytes) != expected_bytes:
+                raise RuntimeError(
+                    f"SDXL raw image has {len(raw_bytes)} bytes, expected {expected_bytes}"
+                )
+            img_rgb = Image.frombytes("RGB", (actual_w, actual_h), raw_bytes)
             meta = {
-                "id": image_id, "prompt": prompt,
+                "id": image_id,
+                "prompt": prompt,
                 "negative_prompt": negative_prompt or "",
-                "sampler": sampler,
-                "width": width - width % 8, "height": height - height % 8,
-                "steps": steps, "guidance": guidance,
-                "seed": seed, "quantization": None,
-                "loras": loras or [], "generation_time": elapsed,
-                "load_time": 0.0,
+                "sampler": actual_sampler,
+                "scheduler": result.get("scheduler"),
+                "width": actual_w,
+                "height": actual_h,
+                "steps": int(result.get("steps", steps)),
+                "guidance": actual_guidance,
+                "seed": seed,
+                "quantization": actual_quantization,
+                "loras": actual_loras,
+                "generation_time": result["generation_time"],
+                "load_time": result.get("load_time", 0.0),
                 "created_at": time.time(),
                 "software": "MLX-DIFFUSION",
                 "generator": "MLX-DIFFUSION",
-"artist": app_settings.metadata_artist(),
+                "artist": app_settings.metadata_artist(),
                 "tags": [],
-                "file": final_image_path.name, "model": minfo["repo"],
+                "file": final_image_path.name,
+                "model": minfo["repo"],
+                "engine": "sdxl",
                 "stealth": stealth,
                 "format": fmt,
-                "fast_vae": bool(fast_vae),
-                "cache_interval": max(1, int(cache_interval)),
+                "fast_vae": bool(result.get("fast_vae", fast_vae)),
+                "cache_interval": int(result.get("cache_interval", cache_interval)),
+                "cache_final_step": bool(result.get("cache_final_step", cache_interval > 1)),
+                "tile_vae": bool(result.get("tile_vae", tile_vae)),
             }
             if minfo.get("civitai_version_id"):
                 meta["modelVersionId"] = minfo["civitai_version_id"]
@@ -2037,10 +2726,6 @@ def _generate_sdxl(prompt, width, height, steps, guidance, seed, loras,
                 meta["model_label"] = minfo["civitai_model_name"]
             if minfo.get("civitai_version_name"):
                 meta["modelVersionName"] = minfo["civitai_version_name"]
-            actual_w = width - width % 8
-            actual_h = height - height % 8
-            img_rgb = Image.frombytes("RGB", (actual_w, actual_h), raw_image_path.read_bytes())
-
             save_image_with_metadata(
                 image=img_rgb,
                 dest_path=final_image_path,
@@ -2048,14 +2733,18 @@ def _generate_sdxl(prompt, width, height, steps, guidance, seed, loras,
                 output_format=fmt,
                 stealth=stealth,
             )
-            try:
-                raw_image_path.unlink()
-            except OSError:
-                pass
-            (GENERATED_DIR / f"{image_id}.json").write_text(json.dumps(meta, indent=2))
+            atomic_write_json(GENERATED_DIR / f"{image_id}.json", meta)
             gc.collect()
             return meta
+        except BaseException:
+            _kill_sdxl_daemon()
+            raise
         finally:
+            if raw_image_path is not None:
+                try:
+                    raw_image_path.unlink()
+                except OSError:
+                    pass
             _arm_sdxl_watchdog()
 
 
@@ -2064,8 +2753,7 @@ _qwen_stderr_tail = collections.deque(maxlen=100)
 
 def _drain_qwen_stderr(proc):
     try:
-        for line in iter(proc.stderr.readline, ""):
-            _qwen_stderr_tail.append(line)
+        _read_process_stream(proc.stderr, lambda line: _qwen_stderr_tail.append(f"{line}\n"))
     except Exception:
         pass
 
@@ -2073,26 +2761,30 @@ def _drain_qwen_stderr(proc):
 def _generate_qwen_subprocess(prompt, width, height, steps, guidance, seed,
                               progress_cb=None, phase_cb=None, model="qwen-image-2.1",
                               cancel_event=None, negative_prompt="", sampler=None,
-                              ref_paths=None, image_strength=None,
+                              ref_paths=None, image_strength=None, quantization=4,
                               output_format="png", stealth=False, fast_vae=True):
-    """Qwen-Image 2.1 via a fresh per-job interpreter (see qwen_engine.py).
-
-    The API worker's process-global state corrupts qwen denoising (pink/magenta);
-    a brand-new interpreter is provably clean. Load is ~3s warm, so a per-job
-    subprocess costs little. Lock + pipeline drop guarantee exclusive residency."
-    """
+    global _qwen_process, _qwen_reader_messages, _qwen_reader_done, _qwen_reader_thread
+    global _qwen_stderr_thread, _qwen_stderr_done
+    raw_image_path = None
     with _lock:
+        _kill_sdxl_daemon()
         _cancel_mflux_watchdog()
         try:
             _drop_mflux_pipeline()
             minfo = get_model_info(model) or {}
             seed = seed if seed is not None else int(time.time())
-            t0 = time.time()
+            try:
+                quantization = int(quantization)
+            except (TypeError, ValueError) as e:
+                raise ValueError("Qwen quantization must be an integer") from e
+            sampler_label = str(sampler or minfo.get("default_sampler") or "linear").lower()
+            if sampler_label not in _QWEN_SCHEDULERS:
+                raise ValueError(f"unsupported Qwen sampler: {sampler_label}")
             image_id = uuid.uuid4().hex
             fmt = "jpeg" if str(output_format).lower() in ("jpeg", "jpg") else "png"
             raw_image_path = GENERATED_DIR / f"{image_id}.raw.png"
             final_image_path = GENERATED_DIR / f"{image_id}.{fmt}"
-            sampler_label = (sampler or (minfo.get("default_sampler") or "linear")).lower()
+            model_path = _qwen_local_model(minfo)
             req = {
                 "prompt": prompt,
                 "negative_prompt": negative_prompt or "",
@@ -2107,82 +2799,94 @@ def _generate_qwen_subprocess(prompt, width, height, steps, guidance, seed,
                 "image_strength": image_strength,
                 "fast_vae": bool(fast_vae),
                 "phase_cb": phase_cb is not None,
+                "model_path": model_path,
+                "quantization": quantization,
+                "wired_limit_bytes": _krea_wired_limit_bytes(),
             }
             if phase_cb is not None:
                 phase_cb("preparing", "Preparing prompt & Qwen-Image 2.1 subprocess...")
             _cancel_event.clear()
             engine = Path(__file__).parent / "qwen_engine.py"
             _qwen_stderr_tail.clear()
-            # Launch the engine with the REPO venv's python, not sys.executable: the
-            # venv/bin/* console-script shebangs can point at a stale venv path (an old
-            # rename), which silently swaps in an older mflux whose text-encoder weight
-            # mapping lacks the community-layout prefix fix -> random-init TE -> pink.
-            _repo_python = Path(__file__).resolve().parent.parent / "venv" / "bin" / "python"
-            _python_exe = str(_repo_python) if _repo_python.exists() else sys.executable
+            repo_python = Path(__file__).resolve().parent.parent / "venv" / "bin" / "python"
+            python_exe = str(repo_python) if repo_python.exists() else sys.executable
             proc = subprocess.Popen(
-                [_python_exe, str(engine), json.dumps(req)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1, cwd=str(Path(__file__).resolve().parent),
+                [python_exe, str(engine), json.dumps(req, separators=(",", ":"))],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                bufsize=0,
+                start_new_session=True,
+                cwd=str(Path(__file__).resolve().parent),
             )
-            threading.Thread(target=_drain_qwen_stderr, args=(proc,), daemon=True).start()
+            proc._mlx_process_group = True
+            _qwen_process = proc
+            _qwen_reader_messages, _qwen_reader_done, _qwen_reader_thread = _start_json_reader(proc)
+            _qwen_stderr_done, _qwen_stderr_thread = _start_stderr_reader(proc, _qwen_stderr_tail)
             result = None
             while True:
-                if (cancel_event is not None and cancel_event.is_set()) or _cancel_event.is_set():
-                    proc.kill()
-                    raise GenerationCancelled()
-                r, _, _ = select.select([proc.stdout], [], [], 0.2)
-                if not r:
-                    if proc.poll() is not None:
-                        if result is None:
-                            err = "".join(_qwen_stderr_tail)[-2000:] or "process exited unexpectedly"
-                            raise RuntimeError(f"Qwen engine died: {err}")
-                        break
-                    continue
-                line = proc.stdout.readline()
-                if not line:
-                    if result is None:
-                        err = "".join(_qwen_stderr_tail)[-2000:] or "EOF on stdout"
-                        raise RuntimeError(f"Qwen engine died: {err}")
-                    break
-                line = line.strip()
-                if not line:
-                    continue
+                line = _read_engine_message(
+                    proc,
+                    _qwen_reader_messages,
+                    _qwen_reader_done,
+                    (cancel_event, _cancel_event),
+                    _engine_timeout("QWEN_ENGINE_TIMEOUT_S"),
+                    "Qwen engine",
+                    _qwen_stderr_tail,
+                )
+                if line is None:
+                    err = "".join(_qwen_stderr_tail)[-2000:] or "EOF on stdout"
+                    raise RuntimeError(f"Qwen engine died: {err}")
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(payload, dict):
-                    if "progress" in payload and progress_cb is not None:
-                        progress_cb(payload["progress"]["step"] - 1)
-                    elif "phase" in payload and phase_cb is not None:
-                        phase_cb(payload["phase"], payload.get("detail", ""))
-                    elif "diag" in payload:
-                        print(f"[qwen-engine diag] {json.dumps(payload)}", flush=True)
-                    elif "error" in payload:
-                        result = payload
-                    else:
-                        result = payload
+                if not isinstance(payload, dict):
+                    continue
+                if "progress" in payload:
+                    step = payload["progress"].get("step")
+                    if progress_cb is not None and isinstance(step, int):
+                        progress_cb(max(0, step - 1))
+                elif "phase" in payload:
+                    if phase_cb is not None:
+                        phase_cb(str(payload["phase"]), str(payload.get("detail", "")))
+                elif "diag" in payload:
+                    print(f"[qwen-engine diag] {json.dumps(payload)}", flush=True)
+                else:
+                    result = payload
+                    break
             if result is None:
                 err = "".join(_qwen_stderr_tail)[-2000:] or "no result received"
                 raise RuntimeError(f"Qwen engine returned no result: {err}")
-            if "error" in result:
-                raise RuntimeError(result["error"])
+            if result.get("error"):
+                raise RuntimeError(str(result["error"]))
             if phase_cb is not None:
                 phase_cb("saving", "Finalizing image and metadata...")
-            elapsed = result["generation_time"]
+            with Image.open(raw_image_path) as source:
+                image = source.copy()
+            actual_w = int(result.get("width", image.width))
+            actual_h = int(result.get("height", image.height))
+            if image.size != (actual_w, actual_h):
+                raise RuntimeError(
+                    f"Qwen returned {image.width}x{image.height}, expected {actual_w}x{actual_h}"
+                )
+            actual_sampler = result.get("sampler") or sampler_label
+            actual_guidance = float(result.get("guidance", guidance if guidance is not None else 1.0))
+            actual_quantization = result.get("quantization", quantization)
             meta = {
                 "id": image_id,
                 "prompt": prompt,
                 "negative_prompt": negative_prompt or "",
-                "sampler": result.get("sampler") or sampler_label,
-                "width": width,
-                "height": height,
-                "steps": result.get("steps", steps),
-                "guidance": guidance if guidance is not None else (minfo.get("default_guidance") or 1.0),
+                "sampler": actual_sampler,
+                "scheduler": result.get("scheduler"),
+                "width": actual_w,
+                "height": actual_h,
+                "steps": int(result.get("steps", steps)),
+                "guidance": actual_guidance,
                 "seed": seed,
-                "quantization": 4,
+                "quantization": actual_quantization,
                 "loras": [],
-                "generation_time": elapsed,
+                "generation_time": result["generation_time"],
                 "load_time": result.get("load_time", 0.0),
                 "created_at": time.time(),
                 "software": "MLX-DIFFUSION",
@@ -2191,11 +2895,15 @@ def _generate_qwen_subprocess(prompt, width, height, steps, guidance, seed,
                 "tags": [],
                 "file": final_image_path.name,
                 "model": minfo["repo"],
+                "engine": "qwen",
                 "reference_images": [Path(p).name for p in (ref_paths or [])],
                 "stealth": stealth,
                 "format": fmt,
-                "fast_vae": bool(fast_vae),
+                "fast_vae": False,
+                "tiled_vae": bool(result.get("tiled_vae")),
             }
+            if ref_paths and image_strength is not None:
+                meta["reference_strength"] = round(float(image_strength), 3)
             if minfo.get("civitai_version_id"):
                 meta["modelVersionId"] = minfo["civitai_version_id"]
             if minfo.get("civitai_model_id"):
@@ -2204,21 +2912,43 @@ def _generate_qwen_subprocess(prompt, width, height, steps, guidance, seed,
                 meta["model_label"] = minfo["civitai_model_name"]
             if minfo.get("civitai_version_name"):
                 meta["modelVersionName"] = minfo["civitai_version_name"]
-            img = Image.open(raw_image_path)
             save_image_with_metadata(
-                image=img,
+                image=image,
                 dest_path=final_image_path,
                 meta=meta,
                 output_format=fmt,
                 stealth=stealth,
             )
-            try:
-                raw_image_path.unlink()
-            except OSError:
-                pass
-            (GENERATED_DIR / f"{image_id}.json").write_text(json.dumps(meta, indent=2))
+            atomic_write_json(GENERATED_DIR / f"{image_id}.json", meta)
             gc.collect()
             return meta
+        except Exception:
+            _kill_qwen_process()
+            raise
         finally:
+            _kill_qwen_process()
+            if raw_image_path is not None:
+                try:
+                    raw_image_path.unlink()
+                except OSError:
+                    pass
             _arm_mflux_watchdog()
+
+
+def _shutdown_engines():
+    try:
+        _kill_qwen_process()
+    except Exception:
+        pass
+    try:
+        _kill_sdxl_daemon()
+    except Exception:
+        pass
+    try:
+        _drop_mflux_pipeline()
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_engines)
 

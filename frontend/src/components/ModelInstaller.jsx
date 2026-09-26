@@ -18,14 +18,13 @@ export default function ModelInstaller({ modelInfo, onInstalled }) {
   const refresh = async () => {
     try {
       const tasks = await api("/api/models/downloads");
-      const mine = tasks.find(
-        (t) => t.model_id === modelInfo.id && (t.status === "downloading" || t.status === "pending")
-      );
-      setTask(mine || null);
+      const matching = tasks.filter((t) => t.model_id === modelInfo.id);
+      const mine = matching.find((t) => t.status === "downloading" || t.status === "pending") || matching[0] || null;
+      setTask(mine);
       const done = tasks.find((t) => t.model_id === modelInfo.id && t.status === "done");
       if (done) onInstalled?.();
-    } catch {
-      /* backend briefly unreachable */
+    } catch (e) {
+      setLocalError(e.message || String(e));
     }
   };
 
@@ -38,6 +37,7 @@ export default function ModelInstaller({ modelInfo, onInstalled }) {
 
   const start = async () => {
     setStarting(true);
+    setLocalError(null);
     try {
       const res = await api("/api/models/download", {
         method: "POST",
@@ -48,8 +48,8 @@ export default function ModelInstaller({ modelInfo, onInstalled }) {
       } else {
         await refresh();
       }
-    } catch {
-      /* keep going; poll will surface any error task */
+    } catch (e) {
+      setLocalError(e.message || String(e));
     } finally {
       setStarting(false);
     }
@@ -100,6 +100,7 @@ export default function ModelInstaller({ modelInfo, onInstalled }) {
     }
   };
 
+  const canDownload = Boolean(modelInfo.download_repo);
   const pct = task && task.total_bytes > 0 ? Math.min(99, Math.round((task.downloaded_bytes / task.total_bytes) * 100)) : 0;
   const showBar = task && (task.status === "downloading" || task.status === "pending");
 
@@ -123,21 +124,30 @@ export default function ModelInstaller({ modelInfo, onInstalled }) {
             ✕
           </button>
         ) : (
-          !task && (
-            <div className="model-installer-actions">
-              <button type="button" className="btn-open-token" onClick={start} disabled={starting}>
-                {starting ? "Starting…" : "Download"}
+          <>
+            {!task && (
+              <div className="model-installer-actions">
+                {canDownload && (
+                  <button type="button" className="btn-open-token" onClick={start} disabled={starting}>
+                    {starting ? "Starting…" : "Download"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className={`btn-mini${showLocal ? " active" : ""}`}
+                  onClick={() => (showLocal ? setShowLocal(false) : openLocal())}
+                  title="Install from a folder already on disk (HF cache or local)"
+                >
+                  📁 Local…
+                </button>
+              </div>
+            )}
+            {task?.status === "error" && (
+              <button type="button" className="btn-open-token" onClick={() => { setTask(null); start(); }} disabled={starting}>
+                {starting ? "Starting…" : "Retry"}
               </button>
-              <button
-                type="button"
-                className={`btn-mini${showLocal ? " active" : ""}`}
-                onClick={() => (showLocal ? setShowLocal(false) : openLocal())}
-                title="Install from a folder already on disk (HF cache or local)"
-              >
-                📁 Local…
-              </button>
-            </div>
-          )
+            )}
+          </>
         )}
       </div>
 
@@ -162,6 +172,8 @@ export default function ModelInstaller({ modelInfo, onInstalled }) {
           </div>
         </div>
       )}
+
+      {localError && !showLocal && <span className="error" role="alert">{localError}</span>}
 
       {showLocal && !showBar && (
         <div className="model-installer-local">

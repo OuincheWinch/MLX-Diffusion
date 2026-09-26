@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, API_BASE } from "../api";
+import Dialog from "./Dialog";
 import GenerationStack from "./GenerationStack";
 import ResultCanvas from "./ResultCanvas";
 import UniversalDownloader from "./UniversalDownloader";
@@ -7,6 +8,7 @@ import LoraManagerDrawer from "./LoraManagerDrawer";
 import ModelInstaller from "./ModelInstaller";
 import GenerationParams from "./GenerationParams";
 import { findLoraEntry, getModelBase, isKreaDistillLora } from "../utils/loraUtils";
+import { normalizeRequest, referenceItems, resolveRequestModel } from "../utils/requestUtils";
 import { useGenerationJob } from "../hooks/useGenerationJob";
 import { useModelConfig } from "../hooks/useModelConfig";
 import { useLoraPanel } from "../hooks/useLoraPanel";
@@ -19,25 +21,55 @@ function getNextSeed(currentSeed) {
   return Math.floor(Date.now() % 1000000);
 }
 
+function generationLoraPayload(loras) {
+  return (Array.isArray(loras) ? loras : [])
+    .filter((lora) => typeof lora?.path === "string" && lora.path.trim())
+    .map((lora) => {
+      const scale = Number(lora.scale ?? 1);
+      return { path: lora.path, scale: Number.isFinite(scale) ? scale : 1 };
+    });
+}
+
 function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-const KREA_DISTILL_FALLBACK_PATH =
-  "/Volumes/Externe/IA/MLX-DIFFUSION OpenCode/backend/data/lora_files/krea2_turbo_4step_rank_64_lora_latest.safetensors";
+function modelNeedsConfirmation(modelInfo) {
+  return Boolean(
+    modelInfo?.experimental
+      || modelInfo?.requires_confirmation
+      || modelInfo?.confirmation_required
+      || /experimental/i.test(String(modelInfo?.label || "")),
+  );
+}
+
+function enhancerEngineFor(modelInfo, model) {
+  return modelInfo?.id
+    || modelInfo?.enhancer_engine
+    || modelInfo?.prompt_enhancer_engine
+    || modelInfo?.enhancer_key
+    || modelInfo?.ecosystem
+    || model
+    || "";
+}
 
 function kreaDistillUpdater(steps, registry) {
   if (steps > 4) {
     return (prev) => prev.filter((l) => !(isKreaDistillLora(l) && l.autoDistill));
   }
   const regEntry = (registry || []).find(
-    (l) => l.base_model === "krea2" && isKreaDistillLora(l)
+    (l) => l.base_model === "krea2" && isKreaDistillLora(l),
   );
-  const path = regEntry?.path || KREA_DISTILL_FALLBACK_PATH;
-  const name = regEntry?.name || "krea2_turbo_4step_rank_64_lora_latest";
+  if (!regEntry?.path) return (prev) => prev;
   return (prev) => {
     if (prev.some(isKreaDistillLora)) return prev;
-    return [...prev, { path, scale: 1.0, name, base_model: "krea2", autoDistill: true }];
+    return [...prev, {
+      path: regEntry.path,
+      scale: 1.0,
+      name: regEntry.name,
+      base_model: regEntry.base_model || "krea2",
+      autoDistill: true,
+    }];
   };
 }
 
@@ -69,7 +101,6 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     currentResult,
     setCurrentResult,
     batchResults,
-    setBatchResults,
     submittedParams,
     setSubmittedParams,
     showSwitchDialog,
@@ -83,6 +114,8 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     model,
     setModel,
     modelInfo,
+    loading: modelsLoading,
+    error: modelsError,
     refreshModels,
   } = useModelConfig({ onModelChange });
 
@@ -100,6 +133,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     setLoras,
     loraRegistry,
     setLoraRegistry,
+    refreshLoraRegistry,
     newLora,
     setNewLora,
     savingLora,
@@ -132,59 +166,79 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
   const [maxPixels, setMaxPixels] = useState(null);
   const [enhancing, setEnhancing] = useState(false);
   const [enhanceJson, setEnhanceJson] = useState(false);
+  const [enhanceFeedback, setEnhanceFeedback] = useState(null);
   const [showEnhanceWarning, setShowEnhanceWarning] = useState(false);
   const enhanceAbortRef = useRef(null);
+  const enhanceRequestRef = useRef(0);
+  const hydrationKeyRef = useRef(null);
+  const pendingRequestRef = useRef(null);
+  const initialModelDefaultsAppliedRef = useRef(false);
 
-  useEffect(() => () => enhanceAbortRef.current?.abort(), []);
+  useEffect(() => () => {
+    enhanceAbortRef.current?.abort();
+    enhanceRequestRef.current += 1;
+  }, []);
 
 
+
+  const hydrateRequest = useCallback((request) => {
+    const source = normalizeRequest(request);
+    const requestedModel = source.model;
+    const matched = resolveRequestModel(source, models);
+    const target = matched || (!requestedModel ? models.find((item) => item.id === model) : null);
+    const targetInfo = target || modelInfo;
+    const supportsReference = Boolean(targetInfo?.supports_ref || targetInfo?.supports_multi_reference);
+    const targetMaxReferences = Math.max(1, Number(targetInfo?.max_reference_images) || 1);
+    const nextSampler = source.sampler && targetInfo?.samplers?.includes(source.sampler)
+      ? source.sampler
+      : targetInfo?.default_sampler || targetInfo?.samplers?.[0] || "";
+
+    setPrompt(source.prompt);
+    setWidth(Number(source.width) || 1024);
+    setHeight(Number(source.height) || 1024);
+    setSteps(Number(source.steps) || targetInfo?.default_steps || 4);
+    setGuidance(source.guidance == null ? targetInfo?.default_guidance ?? 1 : Number(source.guidance));
+    setSeed(source.seed ?? "");
+    setBatch(Math.max(1, Number(source.batch) || 1));
+    setNegativePrompt(source.negative_prompt || "");
+    setSampler(nextSampler);
+    setCacheInterval(Math.max(1, Number(source.cache_interval) || 1));
+    setLoras(Array.isArray(source.loras) ? source.loras : []);
+    setOutputFormat(source.output_format || "png");
+    setStealthMode(Boolean(source.stealth));
+    setFastVae(targetInfo?.supports_fast_vae
+      ? (source.fast_vae == null ? Boolean(targetInfo?.default_fast_vae ?? true) : Boolean(source.fast_vae))
+      : false);
+    setMaxPixels(
+      source.max_pixels != null && (!targetInfo?.max_pixels || source.max_pixels <= targetInfo.max_pixels)
+        ? Number(source.max_pixels)
+        : targetInfo?.max_pixels || null,
+    );
+    setRefStrength(source.reference_strength == null ? 0.6 : Number(source.reference_strength));
+    setRefImages(supportsReference ? referenceItems(source).slice(0, targetMaxReferences) : []);
+    if (target) setModel(target.id);
+    if (source.id) setCurrentResult(source);
+    setEnhanceFeedback(null);
+    if (requestedModel && !matched) {
+      setError(`Model "${requestedModel}" is not available in the current registry.`);
+    }
+    return matched;
+  }, [model, modelInfo, models, setError, setModel]);
 
   useEffect(() => {
-    if (initialParams) {
-      setPrompt(initialParams.prompt ?? "");
-      const matched = models.find(
-        (m) => m.id === initialParams.model || m.repo === initialParams.model
-      );
-      const targetId = matched?.id ?? (models.some((m) => m.id === initialParams.model) ? initialParams.model : (initialParams.model || "flux2-klein-4b"));
-      setModel(targetId);
-      setWidth(initialParams.width ?? 1024);
-      setHeight(initialParams.height ?? 1024);
-      setSteps(initialParams.steps ?? (targetId === "z-image-turbo" || targetId === "krea2-turbo" ? 8 : 4));
-      if (initialParams.guidance != null) setGuidance(initialParams.guidance);
-      setSeed(initialParams.seed ?? "");
-      setLoras(initialParams.loras ?? []);
-      if (initialParams.id) {
-        setCurrentResult(initialParams);
-      }
-      if (initialParams.reference_images && Array.isArray(initialParams.reference_images)) {
-        setRefImages(
-          initialParams.reference_images.map((p) => ({
-            id: crypto.randomUUID(),
-            path: p,
-            preview: p.startsWith("http") || p.startsWith("/") ? p : `/api/images/${p.replace(/\.png$/, "")}/file?thumb=true`,
-            name: p.split("/").pop(),
-          }))
-        );
-      } else if (initialParams.reference_image) {
-        const p = initialParams.reference_image;
-        setRefImages([
-          {
-            id: crypto.randomUUID(),
-            path: p,
-            preview: p.startsWith("http") || p.startsWith("/") ? p : `/api/images/${p.replace(/\.png$/, "")}/file?thumb=true`,
-            name: p.split("/").pop(),
-          },
-        ]);
-      }
-      if (initialParams.format) setOutputFormat(initialParams.format);
-      if (initialParams.stealth != null) setStealthMode(Boolean(initialParams.stealth));
-      if (initialParams.fast_vae != null) setFastVae(Boolean(initialParams.fast_vae));
-      if (initialParams.max_pixels) setMaxPixels(initialParams.max_pixels);
-      if (initialParams.sampler && matched?.samplers?.includes(initialParams.sampler)) {
-        setSampler(initialParams.sampler);
-      }
-    }
-  }, [initialParams, models]);
+    if (!initialParams || !models.length) return;
+    const key = initialParams.key ?? initialParams.id ?? initialParams;
+    if (hydrationKeyRef.current === key) return;
+    hydrationKeyRef.current = key;
+    hydrateRequest(initialParams);
+  }, [hydrateRequest, initialParams, models.length]);
+
+  useEffect(() => {
+    if (!models.length || !pendingRequestRef.current) return;
+    const request = pendingRequestRef.current;
+    pendingRequestRef.current = null;
+    hydrateRequest(request);
+  }, [hydrateRequest, models.length]);
 
   // Apply saved global defaults to a freshly-mounted (empty) form once.
   const defaultsApplied = useRef(false);
@@ -198,11 +252,38 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     if (appSettings.default_sampler) setSampler(appSettings.default_sampler);
   }, [appSettings, initialParams]);
 
+  useEffect(() => {
+    if (initialModelDefaultsAppliedRef.current || initialParams || !modelInfo?.id || pendingRequestRef.current) return;
+    initialModelDefaultsAppliedRef.current = true;
+    const preset = modelInfo.presets?.[0];
+    setSteps(Number(modelInfo.default_steps ?? preset?.steps ?? 4));
+    setGuidance(Number(modelInfo.default_guidance ?? 1));
+    setCacheInterval(Number(modelInfo.default_cache_interval ?? 1));
+    setFastVae(modelInfo.supports_fast_vae ? Boolean(modelInfo.default_fast_vae ?? true) : false);
+    setSampler(
+      modelInfo.samplers?.length
+        ? modelInfo.default_sampler && modelInfo.samplers.includes(modelInfo.default_sampler)
+          ? modelInfo.default_sampler
+          : modelInfo.samplers[0]
+        : "",
+    );
+    let nextWidth = Number(modelInfo.default_width) || Number(preset?.width) || width;
+    let nextHeight = Number(modelInfo.default_height) || Number(preset?.height) || height;
+    if (modelInfo.max_pixels && nextWidth * nextHeight > modelInfo.max_pixels) {
+      const scale = Math.sqrt(modelInfo.max_pixels / (nextWidth * nextHeight));
+      nextWidth = Math.max(256, Math.round((nextWidth * scale) / 16) * 16);
+      nextHeight = Math.max(256, Math.round((nextHeight * scale) / 16) * 16);
+    }
+    setWidth(nextWidth);
+    setHeight(nextHeight);
+    setMaxPixels(modelInfo.max_pixels ?? null);
+  }, [height, initialParams, modelInfo, width]);
+
   // Reactive Guard: Ensure active LoRAs are strictly compatible with the current model
   useEffect(() => {
     if (!loraRegistry || !loraRegistry.length) return;
     const currentBase = getModelBase(modelInfo, model);
-    const supportsLoras = Boolean(modelInfo?.supports_loras || modelInfo?.lora_format);
+    const supportsLoras = Boolean(modelInfo?.supports_loras);
 
     setLoras((currentLoras) => {
       if (!supportsLoras || !currentBase) {
@@ -237,94 +318,73 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     }
   }
 
-  function switchModel(id) {
+  const switchModel = useCallback((id) => {
+    const nextModel = models.find((item) => item.id === id);
+    if (!nextModel) {
+      setError(`Model "${id}" is not available in the current registry.`);
+      return;
+    }
     setModel(id);
-    const m = models.find((x) => x.id === id);
-    if (!m) return;
-    onModelChange?.(m.label);
-    const defSteps = m.default_steps ?? (id === "z-image-turbo" || id === "krea2-turbo" ? 8 : 4);
-    setSteps(defSteps);
-    // Reset the editable hard pixel cap to this model's ceiling on engine switch
-    setMaxPixels(m.max_pixels && m.max_side ? m.max_pixels : null);
-    if (m.presets && m.presets.length > 0) {
-      if ((m.max_pixels && width * height > m.max_pixels) || id === "krea2-turbo" || id === "z-image-turbo") {
-        setWidth(m.presets[0].width);
-        setHeight(m.presets[0].height);
-        setSteps(m.default_steps ?? (id === "z-image-turbo" || id === "krea2-turbo" ? 8 : m.presets[0].steps));
-      }
+    onModelChange?.(nextModel.label);
+    const firstPreset = nextModel.presets?.[0];
+    const nextSteps = Number(nextModel.default_steps ?? firstPreset?.steps ?? 4);
+    setSteps(nextSteps);
+    setMaxPixels(nextModel.max_pixels ?? null);
+    const defaultWidth = Number(nextModel.default_width);
+    const defaultHeight = Number(nextModel.default_height);
+    if (defaultWidth && defaultHeight) {
+      setWidth(defaultWidth);
+      setHeight(defaultHeight);
+    } else if (nextModel.max_pixels && width * height > nextModel.max_pixels) {
+      const scale = Math.sqrt(nextModel.max_pixels / (width * height));
+      setWidth(Math.max(256, Math.round(width * scale / 16) * 16));
+      setHeight(Math.max(256, Math.round(height * scale / 16) * 16));
+    } else if (firstPreset && (!nextModel.max_pixels || width * height > nextModel.max_pixels)) {
+      setWidth(firstPreset.width);
+      setHeight(firstPreset.height);
     }
-    // drop LoRAs incompatible with the new engine
-    const targetBase = getModelBase(m, id);
-    const supportsLoras = Boolean(m?.supports_loras || m?.lora_format);
-    if (!supportsLoras || !targetBase) {
-      setLoras([]);
-      if (id === "krea2-turbo" || id === "z-image-turbo") setSteps(m.default_steps ?? 8);
+    if (nextModel.default_guidance != null) setGuidance(nextModel.default_guidance);
+    if (nextModel.default_cache_interval != null) setCacheInterval(nextModel.default_cache_interval);
+    if (nextModel.default_fast_vae != null) setFastVae(Boolean(nextModel.default_fast_vae));
+    else if (!nextModel.supports_fast_vae) setFastVae(false);
+    if (nextModel.samplers?.length) {
+      setSampler(nextModel.default_sampler && nextModel.samplers.includes(nextModel.default_sampler)
+        ? nextModel.default_sampler
+        : nextModel.samplers[0]);
     } else {
-      setLoras((ls) => {
-        const kept = ls.filter((l) => {
-          const entry = findLoraEntry(l, loraRegistry);
-          const lBase = entry?.base_model || l.base_model;
-          return lBase === targetBase;
-        });
-        if (id === "krea2-turbo") {
-          const has4Step = kept.some(isKreaDistillLora);
-          setSteps(has4Step ? 4 : 8);
-        } else if (id === "z-image-turbo") {
-          setSteps(8);
-        }
-        return kept;
-      });
+      setSampler("");
     }
-    if (m.samplers && m.samplers.length > 0) {
-      setSampler((prev) => {
-        if (m.default_sampler && m.samplers.includes(m.default_sampler)) return m.default_sampler;
-        return m.samplers.includes(prev) ? prev : m.samplers[0];
-      });
+    const targetBase = getModelBase(nextModel, id);
+    if (!nextModel.supports_loras || !targetBase) {
+      setLoras([]);
+    } else {
+      setLoras((current) => current.filter((lora) => {
+        const entry = findLoraEntry(lora, loraRegistry);
+        return (entry?.base_model || lora.base_model) === targetBase;
+      }));
     }
-    if (m.default_cache_interval != null) setCacheInterval(m.default_cache_interval);
-    if (m.default_fast_vae != null) setFastVae(Boolean(m.default_fast_vae));
-    if (!m.supports_guidance && m.default_guidance == null) return;
-    if (m.supports_guidance && m.default_guidance != null) setGuidance(m.default_guidance);
-  }
+    setEnhanceFeedback(null);
+  }, [height, loraRegistry, models, onModelChange, setError, setModel, width]);
 
-  // Ensure default steps for z-image-turbo is 8 if currently 9
   useEffect(() => {
-    if (model === "z-image-turbo" && steps === 9) {
-      setSteps(8);
-    }
-  }, [model, steps]);
-
-  // Support loading recovered prompts into form
-  useEffect(() => {
-    function handleLoadPrompt(e) {
-      const p = e.detail;
-      if (!p) return;
-      if (p.prompt != null) setPrompt(p.prompt);
-      if (p.negative_prompt != null) setNegativePrompt(p.negative_prompt);
-      if (p.model) switchModel(p.model);
-      if (p.seed != null) setSeed(p.seed);
-      if (p.width != null) setWidth(p.width);
-      if (p.height != null) setHeight(p.height);
-      if (p.steps != null) setSteps(p.steps);
-      if (p.guidance != null) setGuidance(p.guidance);
-      if (p.batch != null) setBatch(p.batch);
-      if (p.sampler != null) setSampler(p.sampler);
-      if (p.fast_vae != null) setFastVae(p.fast_vae);
-      if (p.max_pixels) setMaxPixels(p.max_pixels);
-      if (Array.isArray(p.loras)) setLoras(p.loras);
+    function handleLoadPrompt(event) {
+      const request = event.detail;
+      if (!request) return;
+      if (!models.length) {
+        pendingRequestRef.current = request;
+        return;
+      }
+      hydrateRequest(request);
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
     window.addEventListener("mlx:load-prompt", handleLoadPrompt);
     return () => window.removeEventListener("mlx:load-prompt", handleLoadPrompt);
-  }, [switchModel]);
+  }, [hydrateRequest, models.length]);
 
-  // Reactive sync for Krea 2 Turbo:
-  // When steps <= 4, automatically pop 4-step distillation LoRA into parameters.
-  // When steps > 4, auto-detach any auto-injected distillation LoRA.
   useEffect(() => {
-    if (model !== "krea2-turbo") return;
+    if (getModelBase(modelInfo, model) !== "krea2") return;
     setLoras(kreaDistillUpdater(steps, loraRegistry));
-  }, [model, steps, loraRegistry]);
+  }, [loraRegistry, model, modelInfo, steps]);
 
   function fmt(s) {
     const m = Math.floor(s / 60);
@@ -332,10 +392,11 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
   }
 
-  const supportsMultiRef = Boolean(modelInfo.supports_multi_reference || model === "flux2-klein-4b" || model === "flux2-klein-9b");
-  const maxRefImages = modelInfo.max_reference_images ?? (supportsMultiRef ? 10 : 1);
-  const supportsRef = supportsMultiRef || model === "z-image-turbo" || Boolean(modelInfo.supports_ref);
-
+  const supportsMultiRef = Boolean(modelInfo.supports_multi_reference);
+  const maxRefImages = Math.max(1, Number(modelInfo.max_reference_images) || 1);
+  const supportsRef = supportsMultiRef || Boolean(modelInfo.supports_ref);
+  const enhancerAvailable = modelInfo.supports_prompt_enhancer !== false;
+  const modelConfirmationRequired = modelNeedsConfirmation(modelInfo);
   const currentParams = () =>
     JSON.stringify({
       prompt,
@@ -348,49 +409,71 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
       quantization: 4,
       batch: Number(batch),
       negative_prompt: modelInfo.supports_negative ? negativePrompt : "",
-      sampler: modelInfo.samplers ? sampler : undefined,
+      sampler: modelInfo.samplers?.length ? sampler : undefined,
       cache_interval: modelInfo.engine === "sdxl" ? Number(cacheInterval) : 1,
-      loras: (modelInfo.supports_loras || model === "flux2-klein-4b" || model === "flux2-klein-9b" ? [...loras].sort((x, y) => x.path.localeCompare(y.path)) : []).slice(0, 16),
+      loras: (modelInfo.supports_loras ? generationLoraPayload([...loras].sort((x, y) => x.path.localeCompare(y.path))) : []).slice(0, 16),
       reference_images: supportsRef ? refImages.map((img) => img.path) : [],
       reference_strength: supportsRef && refImages.length > 0 && !supportsMultiRef ? Number(refStrength) : undefined,
       output_format: outputFormat,
       stealth: stealthMode,
-      fast_vae: fastVae,
+      fast_vae: modelInfo.supports_fast_vae ? fastVae : false,
       max_pixels: maxPixels && maxPixels < (modelInfo.max_pixels ?? Infinity) ? Number(maxPixels) : null,
     });
 
   async function runEnhancePrompt() {
     if (!prompt.trim() || enhancing) return;
-    setEnhancing(true);
-    setError(null);
+    if (!enhancerAvailable) {
+      setError("Prompt enhancement is not available for this model.");
+      return;
+    }
+    const requestId = ++enhanceRequestRef.current;
     const controller = new AbortController();
     enhanceAbortRef.current = controller;
+    setEnhancing(true);
+    setEnhanceFeedback(null);
+    setError(null);
     try {
       const res = await api("/api/prompt/enhance", {
         method: "POST",
         signal: controller.signal,
-        body: JSON.stringify({ prompt, model, loras, format: enhanceJson ? "json" : "text" }),
+        body: JSON.stringify({
+          prompt,
+          model: enhancerEngineFor(modelInfo, model),
+          loras: generationLoraPayload(loras),
+          format: enhanceJson ? "json" : "text",
+        }),
       });
-      if (res?.enhanced) {
+      if (requestId !== enhanceRequestRef.current) return;
+      if (res?.cancelled) {
+        setEnhanceFeedback({ type: "info", text: "Prompt enhancement cancelled." });
+      } else if (res?.enhanced) {
         setPrompt(res.enhanced);
-      }
-    } catch (e) {
-      if (e?.name === "AbortError") {
-        // Cancelled by the user — leave the prompt untouched.
+        setEnhanceFeedback({
+          type: res.parse_error ? "info" : "success",
+          text: res.parse_error ? "Prompt enhanced with a prose fallback." : `Enhanced for ${res.engine || modelInfo.label}.`,
+        });
       } else {
-        console.error("Enhance prompt error:", e);
-        setError(`Prompt enhancer: ${e.message}`);
+        throw new Error("The enhancer returned no prompt.");
       }
+    } catch (err) {
+      if (requestId !== enhanceRequestRef.current || err?.name === "AbortError") return;
+      const message = `Prompt enhancer: ${err.message || err}`;
+      setError(message);
+      setEnhanceFeedback({ type: "error", text: message });
     } finally {
-      if (enhanceAbortRef.current === controller) enhanceAbortRef.current = null;
-      setEnhancing(false);
+      if (requestId === enhanceRequestRef.current) {
+        if (enhanceAbortRef.current === controller) enhanceAbortRef.current = null;
+        setEnhancing(false);
+      }
     }
   }
 
   function handleEnhancePrompt() {
     if (!prompt.trim() || enhancing) return;
-    // Enhancing during a running generation / model load competes for the same
-    // GPU + unified memory, so warn about the slowdown before starting.
+    if (!enhancerAvailable) {
+      setError("Prompt enhancement is not available for this model.");
+      return;
+    }
     if (busy) {
       setShowEnhanceWarning(true);
       return;
@@ -399,9 +482,11 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
   }
 
   function cancelEnhancePrompt() {
+    enhanceRequestRef.current += 1;
     enhanceAbortRef.current?.abort();
     enhanceAbortRef.current = null;
     setEnhancing(false);
+    setEnhanceFeedback({ type: "info", text: "Prompt enhancement cancelled." });
   }
 
   function removeRefImage(index) {
@@ -415,10 +500,17 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
   }
 
   function addRefImage(item) {
-    setRefImages((prev) => {
-      if (prev.length >= maxRefImages) return prev;
-      if (prev.some((x) => x.path === item.path)) return prev;
-      return [...prev, item];
+    if (!supportsRef) {
+      setError(`Reference images are not supported on ${modelInfo.label}.`);
+      return;
+    }
+    setRefImages((previous) => {
+      if (previous.length >= maxRefImages) {
+        setError(`This model accepts at most ${maxRefImages} reference image${maxRefImages === 1 ? "" : "s"}.`);
+        return previous;
+      }
+      if (previous.some((image) => image.path === item.path)) return previous;
+      return [...previous, item];
     });
   }
 
@@ -426,9 +518,17 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     Boolean((f.type && f.type.startsWith("image/")) || /\.(heic|heif|png|jpe?g|webp)$/i.test(f.name || ""));
 
   async function uploadImageFiles(files) {
+    if (!supportsRef) {
+      setError(`Reference images are not supported on ${modelInfo.label}.`);
+      return;
+    }
     const list = Array.from(files).filter(isImageFile);
     if (!list.length) return;
     const remainingSlots = Math.max(0, maxRefImages - refImages.length);
+    if (remainingSlots === 0) {
+      setError(`This model accepts at most ${maxRefImages} reference image${maxRefImages === 1 ? "" : "s"}.`);
+      return;
+    }
     const toUpload = list.slice(0, remainingSlots);
     for (const file of toUpload) {
       const form = new FormData();
@@ -438,10 +538,13 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
         const isHeic = /\.(heic|heif)$/i.test(file.name || "");
         // Use res.url (served as PNG by backend) for HEIC and when available so all browsers render it
         const previewUrl = res.url ? `${API_BASE}${res.url}` : isHeic ? "" : URL.createObjectURL(file);
-        setRefImages((prev) => {
-          if (prev.length >= maxRefImages) return prev;
+        setRefImages((previous) => {
+          if (previous.length >= maxRefImages) {
+            setError(`This model accepts at most ${maxRefImages} reference image${maxRefImages === 1 ? "" : "s"}.`);
+            return previous;
+          }
           return [
-            ...prev,
+            ...previous,
             {
               id: crypto.randomUUID(),
               path: res.path,
@@ -520,17 +623,18 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
     return yiq >= 128 ? "#111" : "#fff";
   }
 
-  function qwenLaunchBlocked() {
-    if (model !== "qwen-image-2.1") return false;
-    return !window.confirm(
-      "Qwen-Image 2.1 is EXPERIMENTAL on this Mac. Launch anyway?\n\n" +
-        "• Slow: ~8–14 minutes per 512×768 image.\n" +
-        "• Results are inconsistent (soft/blurry on complex scenes).\n" +
-        "• Resolutions above 768×768 crash the pipeline (out of memory) and may wedge the app."
-    );
+  function modelLaunchBlocked() {
+    if (!modelConfirmationRequired) return false;
+    const message = modelInfo.confirmation_message
+      || `${modelInfo.label} is marked experimental on this machine. Launch anyway?`;
+    return !window.confirm(message);
   }
 
   async function postGenerate(isQueued = false) {
+    if (!model || modelsLoading || modelsError) {
+      setError(modelsError || "Select an available model before generating.");
+      return;
+    }
     const paramsStr = currentParams();
     let parsedPrompt = prompt;
     try {
@@ -551,7 +655,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
 
   async function handleVariation(meta) {
     if (!meta) return;
-    if (qwenLaunchBlocked()) return;
+    if (modelLaunchBlocked()) return;
     const newSeed = getNextSeed(meta.seed ?? seed);
     setSeed(newSeed);
     try {
@@ -579,7 +683,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
       if (dirty) setShowSwitchDialog(true);
       return;
     }
-    if (qwenLaunchBlocked()) return;
+    if (modelLaunchBlocked()) return;
     try {
       setSubmittedParams(currentParams());
       await postGenerate(false);
@@ -590,7 +694,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
 
   async function queueNext() {
     setShowSwitchDialog(false);
-    if (qwenLaunchBlocked()) return;
+    if (modelLaunchBlocked()) return;
     setSubmittedParams(currentParams());
     try {
       await postGenerate(true);
@@ -628,7 +732,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
   const engineLoading =
     busy && ["downloading", "loading_model", "compiling", "preparing"].includes(jobPhase);
   const engineBase = getModelBase(modelInfo, model);
-  const compatibleLoras = engineBase && (modelInfo.supports_loras || modelInfo.lora_format)
+  const compatibleLoras = engineBase && modelInfo.supports_loras
     ? loraRegistry.filter((r) => r.base_model === engineBase)
     : [];
   const dirty =
@@ -709,9 +813,12 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
               <button
                 type="button"
                 className="color-tool-btn"
-                onClick={handleEnhancePrompt}
-                disabled={enhancing || !prompt.trim()}
-                title="Adaptive AI Prompt Enhancer — EXPERIMENTAL (Qwen 0.5B local LLM). Returns only the prompt, length-capped per engine, no commentary."
+                 onClick={handleEnhancePrompt}
+                 disabled={enhancing || !prompt.trim() || !enhancerAvailable}
+                 title={enhancerAvailable
+                   ? "Enhance the prompt for the selected model using the local prompt engine."
+                   : "Prompt enhancement is not available for this model."}
+
               >
                 {enhancing ? "✨ Enhancing…" : "✨ Enhance (experimental)"}
               </button>
@@ -747,7 +854,8 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
           {showColorPicker && (
             <div className="color-popover">
               <div className="color-popover-header">
-                <span className="color-popover-title">FLUX.2 Exact Color Matching (#HEX)</span>
+                 <span className="color-popover-title">{modelInfo.label} Exact Color Matching (#HEX)</span>
+
                 <button
                   type="button"
                   className="btn-mini"
@@ -810,15 +918,18 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
               <span className="active-hex-label">Active #HEX Colors:</span>
               <div className="active-hex-list">
                 {detectedColors.map((hex) => (
-                  <span
-                    key={hex}
-                    className="active-hex-badge"
-                    style={{ backgroundColor: hex, color: getContrastColor(hex) }}
-                    title="Click to remove from prompt"
-                    onClick={() => removeColorFromPrompt(hex)}
-                  >
-                    {hex} <span className="badge-remove">✕</span>
-                  </span>
+                   <button
+                     key={hex}
+                     type="button"
+                     className="active-hex-badge"
+                     style={{ backgroundColor: hex, color: getContrastColor(hex) }}
+                     title={`Remove ${hex} from prompt`}
+                     aria-label={`Remove ${hex} from prompt`}
+                     onClick={() => removeColorFromPrompt(hex)}
+                   >
+                     {hex} <span className="badge-remove">✕</span>
+                   </button>
+
                 ))}
               </div>
             </div>
@@ -830,13 +941,24 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
                 value={model}
                 onChange={(e) => switchModel(e.target.value)}
               >
-                {(models.length ? models : [modelInfo]).map((m) => (
-                  <option key={m.id} value={m.id} className={m.installed ? "" : "model-option-offline"}>
-                    {m.installed === false ? "⬇ " : ""}{m.label}
-                  </option>
-                ))}
+                 {modelsLoading && <option value="">Loading models…</option>}
+                 {models.map((m) => (
+                   <option key={m.id} value={m.id} className={m.installed ? "" : "model-option-offline"}>
+                     {m.installed === false ? "⬇ " : ""}{m.label}
+                   </option>
+                 ))}
+
               </select>
-              {modelInfo?.civitai_version_id && (
+                {modelsError && (
+                  <p className="error" role="alert">
+                    {modelsError}{" "}
+                    <button type="button" className="btn-mini" onClick={refreshModels}>
+                      Retry
+                    </button>
+                  </p>
+                )}
+               {modelInfo?.civitai_version_id && (
+
                 <a
                   href={`https://civitai.red/models/${modelInfo.civitai_model_id || ""}?modelVersionId=${modelInfo.civitai_version_id}&ref_code=88C8VEBA`}
                   target="_blank"
@@ -866,9 +988,10 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
                   if (p.guidance !== undefined) setGuidance(p.guidance);
                   if (p.sampler !== undefined) setSampler(p.sampler);
                   setCacheInterval(p.cache_interval ?? 1);
-                  if (model === "krea2-turbo") {
-                    setLoras(kreaDistillUpdater(p.steps, loraRegistry));
-                  }
+                   if (getModelBase(modelInfo, model) === "krea2") {
+                     setLoras(kreaDistillUpdater(p.steps, loraRegistry));
+                   }
+
                 }}
                 title={`${p.width}×${p.height}, ${p.steps} steps${p.sampler ? `, ${p.sampler}` : ""}`}
               >
@@ -896,9 +1019,11 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
             setSampler={setSampler}
             cacheInterval={cacheInterval}
             setCacheInterval={setCacheInterval}
-            supportsRef={supportsRef}
-            supportsMultiRef={supportsMultiRef}
-            refImages={refImages}
+             supportsRef={supportsRef}
+             supportsMultiRef={supportsMultiRef}
+             maxReferenceImages={maxRefImages}
+             refImages={refImages}
+
             refStrength={refStrength}
             setRefStrength={setRefStrength}
             pickRefImages={pickRefImages}
@@ -907,13 +1032,15 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
             maxPixels={maxPixels}
             setMaxPixels={setMaxPixels}
           />
-      {modelInfo.lora_format ? (
+      {modelInfo.supports_loras && modelInfo.lora_format ? (
         <LoraManagerDrawer
           loras={loras}
           setLoras={setLoras}
-          loraRegistry={loraRegistry}
-          setLoraRegistry={setLoraRegistry}
-          modelInfo={modelInfo}
+            loraRegistry={loraRegistry}
+            setLoraRegistry={setLoraRegistry}
+            onRegistryRefresh={refreshLoraRegistry}
+           modelInfo={modelInfo}
+
           engineBase={engineBase}
           compatibleLoras={compatibleLoras}
           onSwitchToLoraModel={switchToLoraModel}
@@ -924,11 +1051,9 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
           <details className="lora-add">
             <summary>＋ Import or Register new LoRA</summary>
             <UniversalDownloader
-              engineBase={engineBase}
-              onLoraDownloaded={async () => {
-                const updated = await api("/api/loras");
-                setLoraRegistry(updated);
-              }}
+               engineBase={engineBase}
+               onLoraDownloaded={refreshLoraRegistry}
+
               onSwitchModel={(base) => switchToLoraModel(base)}
             />
             <div className="lora-divider"><span>or register local file</span></div>
@@ -939,7 +1064,7 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
                 onChange={(e) => setNewLora({ ...newLora, name: e.target.value })}
               />
               <input
-                placeholder="HF repo id or /local/path.safetensors"
+                placeholder="/absolute/path/to/lora.safetensors"
                 value={newLora.path}
                 onChange={(e) => setNewLora({ ...newLora, path: e.target.value })}
               />
@@ -970,7 +1095,8 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
         <button
           type="submit"
           className="generate-btn"
-          disabled={busy && !dirty ? true : modelInfo?.installed === false}
+           disabled={modelsLoading || Boolean(modelsError) || !model || (busy && !dirty) || modelInfo?.installed === false}
+
           title={
             modelInfo?.installed === false
               ? "Download this model first"
@@ -1033,64 +1159,74 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
         </p>
       )}
       <GenerationStack />
-      {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
-      )}
+       {error && (
+         <p className="error" role="alert">
+           {error}
+         </p>
+       )}
+       {enhanceFeedback && (
+         <p
+           className={`civitai-feedback ${enhanceFeedback.type}`}
+           role={enhanceFeedback.type === "error" ? "alert" : "status"}
+         >
+           {enhanceFeedback.text}
+         </p>
+       )}
 
-      {showSwitchDialog && (
-        <div className="modal" onClick={() => setShowSwitchDialog(false)}>
-          <div
-            className="modal-body switch-dialog"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3>Generation in progress with different settings</h3>
-            <p>
-              You modified the prompt or parameters. Queue this new generation
-              after the current one, or stop the current one and start now?
-            </p>
-            <div className="detail-actions">
-              <button onClick={queueNext}>Queue after current</button>
-              <button onClick={stopAndSwitch}>Stop current &amp; switch</button>
-              <button onClick={() => setShowSwitchDialog(false)}>Cancel</button>
-            </div>
-          </div>
-        </div>
-      )}
-      {showEnhanceWarning && (
-        <div className="modal" onClick={() => setShowEnhanceWarning(false)}>
-          <div
-            className="modal-body switch-dialog"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3>{engineLoading ? "Model is loading" : "Generation in progress"}</h3>
-            <p>
-              {engineLoading
-                ? "The engine is still loading into unified memory."
-                : "An image is currently being generated."}{" "}
-              The prompt enhancer runs a second local model on the same Apple Silicon
-              GPU and unified memory, so enhancing now can slow the current job and take
-              longer itself. You can cancel the enhancement at any time. Note: the
-              enhancer is experimental — output is cap-length to the engine profile and
-              stripped of any commentary, but quality varies.
-            </p>
-            <div className="detail-actions">
-              <button
-                onClick={() => {
-                  setShowEnhanceWarning(false);
-                  runEnhancePrompt();
-                }}
-              >
-                Enhance anyway
-              </button>
-              <button onClick={() => setShowEnhanceWarning(false)}>Cancel</button>
-            </div>
-          </div>
-        </div>
-      )}
-        </form>
+       </form>
+
       </div>
+
+      <Dialog
+        open={showSwitchDialog}
+        onClose={() => setShowSwitchDialog(false)}
+        bodyClassName="modal-body switch-dialog"
+        ariaLabelledBy="switch-dialog-title"
+        ariaDescribedBy="switch-dialog-description"
+      >
+        <h3 id="switch-dialog-title">Generation in progress with different settings</h3>
+        <p id="switch-dialog-description">
+          You modified the prompt or parameters. Queue this new generation after the current one,
+          or stop the current one and start now?
+        </p>
+        <div className="detail-actions">
+          <button type="button" onClick={queueNext}>Queue after current</button>
+          <button type="button" onClick={stopAndSwitch}>Stop current &amp; switch</button>
+          <button type="button" onClick={() => setShowSwitchDialog(false)}>Cancel</button>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={showEnhanceWarning}
+        onClose={() => setShowEnhanceWarning(false)}
+        bodyClassName="modal-body switch-dialog"
+        ariaLabelledBy="enhance-warning-title"
+        ariaDescribedBy="enhance-warning-description"
+      >
+        <h3 id="enhance-warning-title">
+          {engineLoading ? "Model is loading" : "Generation in progress"}
+        </h3>
+        <p id="enhance-warning-description">
+          {engineLoading
+            ? "The engine is still loading into unified memory."
+            : "An image is currently being generated."}{" "}
+          The prompt enhancer runs a second local model on the same Apple Silicon GPU and unified
+          memory, so enhancing now can slow the current job and take longer itself. You can cancel
+          the enhancement at any time. Output is capped to the selected engine profile.
+        </p>
+        <div className="detail-actions">
+          <button
+            type="button"
+            onClick={() => {
+              setShowEnhanceWarning(false);
+              runEnhancePrompt();
+            }}
+          >
+            Enhance anyway
+          </button>
+          <button type="button" onClick={() => setShowEnhanceWarning(false)}>Cancel</button>
+        </div>
+      </Dialog>
 
       <div className="studio-canvas-pane">
         <ResultCanvas
@@ -1102,15 +1238,18 @@ export default function GenerateForm({ onGenerated, initialParams, onModelChange
           phaseDetail={jobPhaseDetail}
           batchImages={batchResults}
           generatingPrompt={busy ? (generatingPrompt || prompt) : null}
-          onSetReferenceImage={(ref) => {
-            addRefImage({
-              id: crypto.randomUUID(),
-              path: ref.path,
-              preview: ref.preview,
-              name: ref.path.split("/").pop(),
-            });
-          }}
-          onVariation={handleVariation}
+           canSetReference={supportsRef}
+           maxReferenceImages={maxRefImages}
+           onSetReferenceImage={(ref) => {
+             addRefImage({
+               id: crypto.randomUUID(),
+               path: ref.path,
+               preview: ref.preview,
+               name: ref.path.split("/").pop(),
+             });
+           }}
+           onVariation={handleVariation}
+
         />
       </div>
     </div>

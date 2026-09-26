@@ -292,15 +292,15 @@ export default function UniversalDownloader({
                   <span className="civitai-dl-speed">{dl.speed_mb_s} MB/s</span>
                 )}
               </div>
-              {dl.status === "error" && dl.error && dl.error.includes("AUTH_REQUIRED") && (
+              {dl.status === "error" && dl.error && dl.error.includes("AUTH_REQUIRED") && ["civitai", "huggingface"].includes(dl.source) && (
                 <div className="civitai-auth-prompt">
-                  <span>This model requires authentication on Civitai.</span>
+                  <span>{dl.source === "huggingface" ? "This model requires authentication on Hugging Face." : "This model requires authentication on Civitai."}</span>
                   <button
                     type="button"
                     className="btn-open-token"
-                    onClick={() => setTokenAutofocus("civitai")}
+                    onClick={() => setTokenAutofocus(dl.source === "huggingface" ? "hf" : "civitai")}
                   >
-                    🔑 Configure API Key
+                    {dl.source === "huggingface" ? "🔑 Configure HF Token" : "🔑 Configure API Key"}
                   </button>
                 </div>
               )}
